@@ -1,0 +1,2534 @@
+---
+title: "kirc_tcga_sphingolipid"
+author: "Alejandro Sanchez"
+date: "2025-11-05"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+    highlight: tango
+---
+
+Setup
+```{r setup, include=FALSE}
+set.seed(1234)
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 7, fig.height = 5)
+
+# Avoid ANSI/colored output that can break LaTeX
+options(cli.num_colors = 0, crayon.enabled = FALSE)
+
+# Require packages (don’t install during knit)
+need <- c(
+  # CRAN
+  "here","data.table","ggplot2","matrixStats","pheatmap","scales",
+  # Bioconductor
+  "SummarizedExperiment","edgeR","GSVA"
+)
+miss <- need[!vapply(need, requireNamespace, logical(1), quietly = TRUE)]
+if (length(miss)) {
+  stop(
+    "Missing packages: ", paste(miss, collapse = ", "),
+    "\nInstall outside knitting (e.g. renv::restore(), install.packages(), or BiocManager::install())."
+  )
+}
+
+suppressPackageStartupMessages({
+  library(here); library(data.table); library(ggplot2); library(matrixStats); library(pheatmap); library(scales)
+  library(SummarizedExperiment); library(edgeR); library(GSVA)
+})
+
+# Output dirs
+dir.create(here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here("plots","sphingo"),  recursive = TRUE, showWarnings = FALSE)
+
+# Small helpers used later
+pick_first <- function(df, xs){ for (k in xs) if (k %in% names(df)) return(df[[k]]); NULL }
+
+safe_save_pdf <- function(path_pdf, plot, w=7, h=5){
+  ok <- FALSE
+  try({
+    ggsave(path_pdf, plot = plot, width = w, height = h, device = cairo_pdf)
+    if (file.exists(path_pdf) && file.info(path_pdf)$size > 0) ok <- TRUE
+  }, silent = TRUE)
+  if (!ok) try({
+    grDevices::pdf(path_pdf, width = w, height = h, useDingbats = FALSE)
+    print(plot); grDevices::dev.off()
+    if (file.exists(path_pdf) && file.info(path_pdf)$size > 0) ok <- TRUE
+  }, silent = TRUE)
+  invisible(ok)
+}
+```
+
+Read configuration
+```{r read_config}
+# Read starter config produced by the visualization Rmd
+
+cfg_file <- here::here("results","kirc_sphingolipid_starter_config.tsv")
+stopifnot(file.exists(cfg_file))
+
+cfg <- data.table::fread(cfg_file)
+stopifnot(all(c("cfg_key","path") %in% names(cfg)))
+
+cfg_map <- setNames(cfg$path, cfg$cfg_key)
+
+# Path sanity checks (fail fast if anything is missing)
+
+required_keys <- c("expr_tsv","samples_tsv","genes_tsv","bundle_rds")
+missing_keys <- required_keys[!file.exists(cfg_map[required_keys])]
+if (length(missing_keys)) {
+stop("Missing required file(s) from config: ",
+paste(paste0(missing_keys, " -> ", cfg_map[missing_keys]), collapse = "; "))
+}
+
+# Quiet, knit-safe echo
+
+cat("[Config]\n",
+" expr_tsv : ", normalizePath(cfg_map["expr_tsv"], winslash = "/"), "\n",
+" samples  : ", normalizePath(cfg_map["samples_tsv"], winslash = "/"), "\n",
+" genes    : ", normalizePath(cfg_map["genes_tsv"], winslash = "/"), "\n",
+" bundle   : ", normalizePath(cfg_map["bundle_rds"], winslash = "/"), "\n", sep = "")
+```
+Load bundle and grades
+```{r load_bundle_and_grades_fix_assay}
+# Load core bundle (from cfg_map produced earlier)
+
+stopifnot(exists("cfg_map"))
+B <- readRDS(cfg_map["bundle_rds"])
+stopifnot(is.list(B), "se_clean_filtered" %in% names(B), "sample_meta" %in% names(B))
+
+se_filt <- B$se_clean_filtered
+assn    <- B$assay_name
+dge     <- B$dge_tmm
+smeta   <- as.data.frame(B$sample_meta)
+
+# --- Validate/select assay name ---
+
+avail_assays <- SummarizedExperiment::assayNames(se_filt)
+cat("[Assays available] ", paste(avail_assays, collapse = ", "), "\n")
+
+# If bundle's assay_name is missing or not present, try sensible fallbacks
+
+if (is.null(assn) || length(assn) != 1L || !(assn %in% avail_assays)) {
+preferred <- c("unstranded","stranded_first","stranded_second","counts","logcounts")
+assn <- intersect(preferred, avail_assays)[1]
+if (is.na(assn)) assn <- avail_assays[1]
+cat("[Assay] Using:", assn, "\n")
+}
+stopifnot(assn %in% avail_assays)
+
+# --- Align metadata to assay columns ---
+
+A <- SummarizedExperiment::assay(se_filt, assn)
+stopifnot(nrow(A) > 0, ncol(A) > 0)
+stopifnot(nrow(smeta) == ncol(A))
+rownames(smeta) <- colnames(A)
+
+# Ensure 'condition' (Normal/Tumor)
+
+if (!"condition" %in% names(smeta)) {
+smeta$condition <- factor(
+ifelse(smeta$sample_type == "Solid Tissue Normal", "Normal", "Tumor"),
+levels = c("Normal","Tumor")
+)
+}
+
+# Robust LG/HG parser
+
+parse_grade <- function(x){
+  x <- toupper(as.character(x))
+  x <- gsub("[[:space:]]+", "", x)          # instead of "\\s+"
+  ifelse(grepl("G3|G4|HIGH", x), "HG",
+         ifelse(grepl("G1|G2|LOW", x), "LG", NA_character_))
+}
+
+# Derive grade_group for tumors only
+
+rawg <- pick_first(smeta, c("tumor_grade","neoplasm_histologic_grade","grade","histologic_grade"))
+smeta$grade_group <- ifelse(smeta$condition == "Tumor", parse_grade(rawg), NA)
+smeta$grade_group <- factor(smeta$grade_group, levels = c("LG","HG"))
+
+# Console summary
+
+cat("[Bundle]\n",
+"- assay: ", assn, "\n",
+"- SE dims: ", nrow(A), " genes × ", ncol(A), " samples\n", sep = "")
+cat("[Phenotypes]\n")
+print(table(condition = smeta$condition, useNA = "ifany"))
+print(table(grade_group = smeta$grade_group, useNA = "ifany"))
+
+# Objects used later: se_filt, assn, dge, smeta
+```
+
+Curated sphingolipid gene list
+```{r sphingo_gene_sets}
+# Curated sphingolipid subpathways (gene symbols)
+
+ceramide_de_novo <- c("CERS1","CERS2","CERS3","CERS4","CERS5","CERS6","DEGS1","DEGS2")
+salvage_catabolic_pathway_ceramide <- c("ASAH1","ASAH2","ACER1","ACER2","ACER3","SGPP1","SGPP2",
+                                        "SGPL1","GBA1","GBA2","GBA3","GLA","GLB1")
+sphingomyelin_metabolism <- c("SGMS1","SGMS2","SMPD1","SMPD2","SMPD3","SMPD4","ENPP7")
+glycosphingolipid_biosynthesis <- c("UGCG","UGT8","B3GALNT1","B3GALT4","B3GNT5","B4GALNT1",
+                                    "B4GALT5","B4GALT6","ST3GAL2","ST3GAL3","ST3GAL5","ST6GALNAC5",
+                                    "ST6GALNAC6","ST8SIA5","FUT1","FUT2","GALC","GAL3ST1")
+ceramide_transport_regulation <- c("CERT1","OSBP","VAPA","VAPB","ORMDL1","ORMDL2","ORMDL3")
+S1P_signaling <- c("SPHK1","SPHK2","SPNS2")
+lipid_phosphatase_modifiers <- c("PLPP1","PLPP2","PLPP3","PPM1L","PRKD1","PRKD2","PRKD3")
+sulfurylation_lysosomal_processing <- c("ARSA","ARSB","ARSD","ARSF","ARSG","ARSH","ARSI",
+                                        "ARSJ","ARSK","ARSL","SUMF1","SUMF2","PSAP","CTSA",
+                                        "GM2A","HEXA","HEXB","M6PR")
+other_genes <- c("A4GALT","ABCC1","ABCG2","ALDH3A2","ALDH3B1","ALDH3B2","CERK","CSNK1G2","CYB5B","FA2H",
+                 "GLB1L","GLB1L2","GLB1L3","MFSD2B","NEU1","NEU2","NEU3","NEU4","SAMD8","STS")
+
+sphingo_sets <- list(
+  ceramide_de_novo = ceramide_de_novo,
+  salvage_catabolic_pathway_ceramide = salvage_catabolic_pathway_ceramide,
+  sphingomyelin_metabolism = sphingomyelin_metabolism,
+  glycosphingolipid_biosynthesis = glycosphingolipid_biosynthesis,
+  ceramide_transport_regulation = ceramide_transport_regulation,
+  S1P_signaling = S1P_signaling,
+  lipid_phosphatase_modifiers = lipid_phosphatase_modifiers,
+  sulfurylation_lysosomal_processing = sulfurylation_lysosomal_processing,
+  other_genes = other_genes
+)
+
+# Union of all genes
+sphingo_union <- sort(unique(unlist(sphingo_sets, use.names = FALSE)))
+cat("[Sphingo] Total curated genes: ", length(sphingo_union), "\n", sep = "")
+```
+
+sphingo_annotation_coverage
+```{r sphingo_annotation_coverage}
+suppressPackageStartupMessages({ library(here); library(data.table) })
+
+# Inputs from config
+expr_tsv <- cfg_map["expr_tsv"]
+gene_tsv <- cfg_map["genes_tsv"]
+stopifnot(file.exists(expr_tsv), file.exists(gene_tsv))
+
+# Gene annotations: prefer a symbol column if present
+gmeta <- fread(gene_tsv)
+stopifnot("gene_id" %in% names(gmeta))
+sym_col <- intersect(c("gene_name","symbol","hgnc_symbol","SYMBOL"), names(gmeta))[1]
+if (is.na(sym_col)) {
+  gmeta[, gene_name := NA_character_]
+  sym_col <- "gene_name"
+}
+
+# Peek expression header to confirm gene_id column is present
+expr_head <- fread(expr_tsv, nrows = 5)
+stopifnot("gene_id" %in% names(expr_head))
+
+# Coverage of curated sphingolipid symbols in the annotation table (case-insensitive)
+sym_available <- unique(toupper(na.omit(as.character(gmeta[[sym_col]]))))
+union_upper   <- toupper(sphingo_union)
+
+present <- union_upper[union_upper %in% sym_available]
+missing <- setdiff(union_upper, present)
+
+cov_dt <- data.table(
+  gene = sphingo_union,
+  present_in_annotation = union_upper %in% sym_available
+)
+
+dir.create(here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+fwrite(cov_dt, here("results","sphingo","sphingo_gene_coverage.tsv"), sep = "\t")
+
+cat(sprintf("[Coverage] Symbols present in annotations: %d / %d\n",
+            length(present), length(union_upper)))
+if (length(missing)) {
+  message("[Coverage] Missing symbols (check aliases/synonyms): ",
+          paste(missing, collapse = ", "))
+  fwrite(data.table(missing_symbol = sort(missing)),
+         here("results","sphingo","sphingo_missing_symbols.tsv"), sep = "\t")
+}
+```
+
+build_logcpm_symbol_collapse
+```{r build_logcpm_symbol_collapse}
+suppressPackageStartupMessages({ library(data.table); library(edgeR) })
+
+# Preconditions
+stopifnot(exists("dge"), inherits(dge, "DGEList"))
+stopifnot(exists("gmeta"))
+
+# 1) Compute logCPM (genes x samples) from DGE
+logCPM_all <- edgeR::cpm(dge, log = TRUE, prior.count = 1)
+ens        <- rownames(logCPM_all)
+
+# 2) Build Ensembl core -> SYMBOL map from gmeta
+strip_ensembl_version <- function(x) sub("[.][0-9]+$", "", x)
+gm <- as.data.table(gmeta)
+stopifnot("gene_id" %in% names(gm))
+if (!"gene_name" %in% names(gm)) gm[, gene_name := NA_character_]
+gm[, gene_id_core := strip_ensembl_version(gene_id)]
+
+# prefer first non-empty gene_name per core id
+sym_map <- gm[, .(gene_name = na.omit(gene_name[nzchar(gene_name)])[1]), by = gene_id_core]
+
+# 3) Align each row of logCPM_all to a symbol; fallback to Ensembl core if missing
+ens_core   <- strip_ensembl_version(ens)
+symbol_vec <- sym_map$gene_name[match(ens_core, sym_map$gene_id_core)]
+symbol_vec[is.na(symbol_vec) | !nzchar(symbol_vec)] <- ens_core[is.na(symbol_vec) | !nzchar(symbol_vec)]
+
+# 4) Collapse duplicated symbols by averaging rows
+collapse_by_symbol <- function(M, syms) {
+  stopifnot(nrow(M) == length(syms))
+  keep <- nzchar(syms)
+  M <- M[keep, , drop = FALSE]
+  syms <- syms[keep]
+  idx <- split(seq_along(syms), syms)
+  out <- lapply(idx, function(ix) {
+    if (length(ix) == 1L) M[ix, , drop = FALSE] else matrix(colMeans(M[ix, , drop = FALSE]), nrow = 1)
+  })
+  mat <- do.call(rbind, out)
+  rownames(mat) <- names(idx)
+  colnames(mat) <- colnames(M)
+  mat
+}
+
+logCPM_sym <- collapse_by_symbol(logCPM_all, symbol_vec)
+
+cat(sprintf("[Matrix] SYMBOL-collapsed logCPM: %d genes x %d samples\n",
+            nrow(logCPM_sym), ncol(logCPM_sym)))
+
+# 5) Presence/absence report for curated sphingolipid sets (case-insensitive)
+stopifnot(exists("sphingo_sets"))
+rn_upper <- toupper(rownames(logCPM_sym))
+present_report <- lapply(sphingo_sets, function(gs) {
+  gs_u <- toupper(gs)
+  list(present = gs[gs_u %in% rn_upper],
+       missing = setdiff(gs, rownames(logCPM_sym)))
+})
+
+# Console summary
+sphingo_union_upper <- unique(toupper(unlist(sphingo_sets, use.names = FALSE)))
+overlap_n <- sum(sphingo_union_upper %in% rn_upper)
+cat(sprintf("[Sphingo] Overlap with curated sets: %d of %d unique genes\n",
+            overlap_n, length(sphingo_union_upper)))
+cat("[Sphingo] Missing by set:\n")
+for (nm in names(present_report)) {
+  miss <- present_report[[nm]]$missing
+  cat(sprintf(" - %-32s : %d%s\n",
+              nm, length(miss),
+              if (length(miss)) paste0(" (", paste(miss, collapse = ", "), ")") else ""))
+}
+
+# Save a quick presence table
+dir.create(here::here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+presence_dt <- rbindlist(lapply(names(sphingo_sets), function(nm) {
+  data.table(subpathway = nm,
+             gene = sphingo_sets[[nm]],
+             present = toupper(sphingo_sets[[nm]]) %in% rn_upper)
+}))
+data.table::fwrite(presence_dt, here::here("results","sphingo","sphingo_presence_table.tsv"), sep = "\t")
+```
+Find missing sphingolipid genes
+```{r diagnose_sphingo_missing, message=FALSE}
+suppressPackageStartupMessages({ library(data.table) })
+
+sus <- c("CERS1","CERS3","ACER1","GBA1","ST6GALNAC6","ARSH","ALDH3B2","MFSD2B","NEU2")
+alias_map <- c("GBA1"="GBA","LASS1"="CERS1","LASS3"="CERS3")
+
+stopifnot(exists("logCPM_all"), exists("logCPM_sym"), exists("gmeta"))
+ens_core_all <- sub("[.][0-9]+$","", rownames(logCPM_all))
+ens_core_sym <- sub("[.][0-9]+$","", rownames(logCPM_sym))
+
+gm <- as.data.table(gmeta)
+if (!"gene_name" %in% names(gm)) gm[, gene_name := NA_character_]
+gm[, gene_id_core := sub("[.][0-9]+$","", gene_id)]
+
+# 1) Is an alias present?
+alias_hits <- data.table(
+  query = sus,
+  alias = ifelse(sus %in% names(alias_map), alias_map[sus], NA_character_),
+  present_as_alias_in_sym = ifelse(!is.na(ifelse(sus %in% names(alias_map), alias_map[sus], NA_character_)),
+                                   ifelse(alias_map[sus] %in% rownames(logCPM_sym), TRUE, FALSE), NA)
+)
+
+# 2) Does the annotation know this symbol? If yes, which ENSG does it map to?
+ann_hits <- gm[gene_name %in% sus, .(query = gene_name, gene_id_core)]
+ann_hits <- unique(ann_hits)
+
+# 3) If annotation knows it, do we have that ENSG in the matrices (pre/post collapse)?
+ann_hits[, in_logCPM_all := gene_id_core %in% ens_core_all]
+ann_hits[, in_logCPM_sym := gene_id_core %in% ens_core_sym]
+
+# 4) Final table
+res <- merge(data.table(query = sus), alias_hits, by = "query", all.x = TRUE)
+res <- merge(res, ann_hits, by = "query", all.x = TRUE)
+
+print(res[order(query)])
+cat("\nLegend:\n- present_as_alias_in_sym: TRUE → row exists under alias (e.g., GBA instead of GBA1)\n",
+    "- gene_id_core present but symbol missing → matrix likely uses ENSG fallback\n",
+    "- in_logCPM_all=FALSE → filtered out before CPM (low counts/biotype)\n", sep = "")
+```
+
+sphingo_alias_rescue_minimal
+```{r sphingo_alias_rescue_minimal}
+suppressPackageStartupMessages({ library(data.table) })
+stopifnot(exists("logCPM_all"), exists("logCPM_sym"), exists("gmeta"), exists("sphingo_sets"))
+
+# 1) Minimal, high-confidence alias map (why: fix legacy/official renames)
+alias_map <- c(
+  "GBA1" = "GBA",
+  "LASS1" = "CERS1",
+  "LASS3" = "CERS3"
+)
+
+# 2) Rebuild SYMBOL vector aligned to logCPM_all, then apply alias rescue
+strip_ensembl_version <- function(x) sub("[.][0-9]+$", "", x)
+gm <- as.data.table(gmeta)
+if (!"gene_name" %in% names(gm)) gm[, gene_name := NA_character_]
+gm[, gene_id_core := strip_ensembl_version(gene_id)]
+
+ens_core <- strip_ensembl_version(rownames(logCPM_all))
+sym_map  <- gm[, .(gene_name = na.omit(gene_name[nzchar(gene_name)])[1]), by = gene_id_core]
+symbol_vec <- sym_map$gene_name[match(ens_core, sym_map$gene_id_core)]
+symbol_vec[is.na(symbol_vec) | !nzchar(symbol_vec)] <- ens_core[is.na(symbol_vec) | !nzchar(symbol_vec)]
+
+# Apply alias map at the symbol level
+symbol_vec_rescued <- ifelse(symbol_vec %in% names(alias_map), alias_map[symbol_vec], symbol_vec)
+
+# 3) Collapse by rescued symbols (average duplicates)
+collapse_by_symbol <- function(M, syms) {
+  stopifnot(nrow(M) == length(syms))
+  keep <- nzchar(syms)
+  M <- M[keep, , drop = FALSE]; syms <- syms[keep]
+  idx <- split(seq_along(syms), syms)
+  out <- lapply(idx, function(ix) {
+    if (length(ix) == 1L) M[ix, , drop = FALSE] else matrix(colMeans(M[ix, , drop = FALSE]), nrow = 1)
+  })
+  mat <- do.call(rbind, out)
+  rownames(mat) <- names(idx); colnames(mat) <- colnames(M)
+  mat
+}
+logCPM_sym2 <- collapse_by_symbol(logCPM_all, symbol_vec_rescued)
+
+# 4) Compare sphingolipid coverage pre/post rescue and keep the better one
+rn1 <- toupper(rownames(logCPM_sym))
+rn2 <- toupper(rownames(logCPM_sym2))
+sph_union <- unique(toupper(unlist(sphingo_sets, use.names = FALSE)))
+ov1 <- sum(sph_union %in% rn1); ov2 <- sum(sph_union %in% rn2)
+
+cat(sprintf("[Rescue] overlap before: %d  after: %d  (total sphingo genes: %d)\n", ov1, ov2, length(sph_union)))
+if (ov2 >= ov1) {
+  logCPM_sym <- logCPM_sym2
+  cat("[Rescue] Using rescued SYMBOL matrix (improved or equal coverage).\n")
+} else {
+  cat("[Rescue] Keeping original SYMBOL matrix (rescue did not help).\n")
+}
+
+# 5) Report newly recovered curated genes (if any)
+new_hits <- setdiff(rn2[rn2 %in% sph_union], rn1[rn1 %in% sph_union])
+if (length(new_hits)) {
+  dir.create(here::here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+  data.table::fwrite(
+    data.table(recovered_gene = sort(new_hits)),
+    here::here("results","sphingo","sphingo_alias_recovered_genes.tsv"),
+    sep = "\t"
+  )
+  cat("[Rescue] Recovered genes written to results/sphingo/sphingo_alias_recovered_genes.tsv\n")
+} else {
+  cat("[Rescue] No additional sphingolipid genes recovered by alias map.\n")
+}
+```
+
+ssGSEA sphingolipid run
+```{r ssgsea_rankmean_manual, message=FALSE}
+suppressPackageStartupMessages({ library(here); library(data.table) })
+
+# Preconditions
+stopifnot(exists("logCPM_sym"), is.matrix(logCPM_sym))
+stopifnot(exists("sphingo_sets"))
+stopifnot(exists("smeta"))
+
+# Keep only sets with >=5 genes present in the expression matrix (row names are SYMBOLs)
+rn <- rownames(logCPM_sym)
+gs_use <- lapply(sphingo_sets, function(gs) intersect(gs, rn))
+gs_use <- gs_use[vapply(gs_use, length, integer(1)) >= 5]
+stopifnot(length(gs_use) > 0)
+
+# Sample metadata aligned to expression columns
+meta <- data.frame(
+  sample_id   = colnames(logCPM_sym),
+  condition   = if ("condition" %in% names(smeta)) smeta[colnames(logCPM_sym), "condition"] else NA,
+  grade_group = if ("grade_group" %in% names(smeta)) smeta[colnames(logCPM_sym), "grade_group"] else NA,
+  row.names   = colnames(logCPM_sym),
+  stringsAsFactors = FALSE
+)
+
+# ---- Manual "singscore-style" rank-mean scores ----
+# 1) Rank genes within each sample (higher expression = higher rank)
+ranks <- apply(logCPM_sym, 2, function(v) rank(v, ties.method = "average"))
+# 2) Normalize ranks to [0,1]
+ranks01 <- ranks / nrow(ranks)
+
+# 3) For each set, score = mean(normalized ranks of member genes) - 0.5 (centered around 0)
+score_one_set <- function(genes_idx) {
+  colMeans(ranks01[genes_idx, , drop = FALSE]) - 0.5
+}
+set_indices <- lapply(gs_use, function(gs) match(gs, rn))
+ss_list <- lapply(set_indices, score_one_set)
+ss <- do.call(rbind, ss_list)
+rownames(ss) <- names(gs_use)
+colnames(ss) <- colnames(logCPM_sym)
+
+# Checks
+stopifnot(is.matrix(ss), ncol(ss) == nrow(meta))
+stopifnot(identical(colnames(ss), meta$sample_id))
+
+# Save matrix + meta for downstream chunks
+dir.create(here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+fwrite(
+  data.table::as.data.table(ss, keep.rownames = "pathway"),
+  here("results","sphingo","ssgsea_scores_matrix.tsv"),
+  sep = "\t"
+)
+fwrite(
+  data.table::as.data.table(meta),
+  here("results","sphingo","ssgsea_sample_meta.tsv"),
+  sep = "\t"
+)
+
+cat(sprintf("[rank-mean] %d pathways × %d samples; centered scores in [-0.5, 0.5]\n",
+            nrow(ss), ncol(ss)))
+```
+
+ssgsea_stepA_stats_only
+```{r ssgsea_stepA_stats_only, message=FALSE}
+suppressPackageStartupMessages({
+  library(here); library(data.table)
+})
+
+dir.create(here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+# Preconditions
+stopifnot(exists("ss"), is.matrix(ss))
+stopifnot(exists("meta"))
+stopifnot(identical(colnames(ss), meta$sample_id))
+
+# Long table of scores
+scores_long <- as.data.table(t(ss), keep.rownames = "sample_id")
+scores_long <- melt(scores_long, id.vars = "sample_id",
+                    variable.name = "pathway", value.name = "score")
+
+# Attach phenotype
+meta2 <- as.data.table(meta)
+scores_long <- merge(scores_long, meta2, by = "sample_id", all.x = TRUE)
+
+# ---------- A) Tumor vs Normal ----------
+stat_cond <- NULL
+if ("condition" %in% names(scores_long) &&
+    all(c("Normal","Tumor") %in% unique(na.omit(scores_long$condition)))) {
+
+  stat_cond <- scores_long[condition %in% c("Normal","Tumor"),
+    {
+      x <- score[condition=="Tumor"]; y <- score[condition=="Normal"]
+      p <- if (length(x) > 2 && length(y) > 2) wilcox.test(x, y)$p.value else NA_real_
+      list(p = p,
+           n_Tumor = sum(condition=="Tumor"),
+           n_Normal = sum(condition=="Normal"),
+           median_Tumor = median(x), median_Normal = median(y),
+           diff = median(x) - median(y))
+    }, by = pathway]
+  stat_cond[, padj := p.adjust(p, method = "BH")]
+  fwrite(stat_cond, here("results","sphingo","rankmean_stats_condition.tsv"), sep="\t")
+  cat("[Stats] Wrote Tumor vs Normal: results/sphingo/rankmean_stats_condition.tsv\n")
+} else {
+  cat("[Stats] Skipped Tumor vs Normal (missing or incomplete 'condition')\n")
+}
+
+# ---------- B) HG vs LG (tumor-only) ----------
+stat_grade <- NULL
+if ("grade_group" %in% names(scores_long) &&
+    all(c("LG","HG") %in% unique(na.omit(scores_long$grade_group)))) {
+
+  sub_tum <- scores_long[!is.na(grade_group) & grade_group %in% c("LG","HG")]
+  stat_grade <- sub_tum[,
+    {
+      x <- score[grade_group=="HG"]; y <- score[grade_group=="LG"]
+      p <- if (length(x) > 2 && length(y) > 2) wilcox.test(x, y)$p.value else NA_real_
+      list(p = p,
+           n_HG = sum(grade_group=="HG"),
+           n_LG = sum(grade_group=="LG"),
+           median_HG = median(x), median_LG = median(y),
+           diff = median(x) - median(y))
+    }, by = pathway]
+  stat_grade[, padj := p.adjust(p, method = "BH")]
+  fwrite(stat_grade, here("results","sphingo","rankmean_stats_grade.tsv"), sep="\t")
+  cat("[Stats] Wrote HG vs LG: results/sphingo/rankmean_stats_grade.tsv\n")
+} else {
+  cat("[Stats] Skipped HG vs LG (missing or incomplete 'grade_group')\n")
+}
+
+# Small console preview
+if (!is.null(stat_cond)) print(head(stat_cond[order(padj)], 8))
+if (!is.null(stat_grade)) print(head(stat_grade[order(padj)], 8))
+```
+
+ssgsea_stepA_plots
+```{r ssgsea_stepA_plots, message=FALSE}
+suppressPackageStartupMessages({
+  library(here); library(data.table); library(ggplot2)
+})
+
+dir.create(here("plots","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+# Preconditions
+stopifnot(exists("ss"), is.matrix(ss))
+stopifnot(exists("meta"))
+stopifnot(identical(colnames(ss), meta$sample_id))
+
+# Long table of scores
+scores_long <- as.data.table(t(ss), keep.rownames = "sample_id")
+scores_long <- melt(scores_long, id.vars = "sample_id",
+                    variable.name = "pathway", value.name = "score")
+scores_long <- merge(scores_long, as.data.table(meta), by = "sample_id", all.x = TRUE)
+
+safe_pdf <- function(path_pdf, plot, w=6, h=4){
+  ok <- FALSE
+  # Try cairo (handles fonts cleanly)
+  try({ ggsave(path_pdf, plot=plot, width=w, height=h, device=cairo_pdf)
+       if (file.exists(path_pdf) && file.info(path_pdf)$size > 0) ok <- TRUE }, silent = TRUE)
+  # Fallback base pdf()
+  if (!ok) try({ pdf(path_pdf, width=w, height=h, useDingbats = FALSE); print(plot); dev.off()
+                 if (file.exists(path_pdf) && file.info(path_pdf)$size > 0) ok <- TRUE }, silent = TRUE)
+  invisible(ok)
+}
+
+# ---------- A) Tumor vs Normal ----------
+if ("condition" %in% names(scores_long) &&
+    all(c("Normal","Tumor") %in% unique(na.omit(scores_long$condition)))) {
+
+  # Load stats (for BH p)
+  stat_path <- here("results","sphingo","rankmean_stats_condition.tsv")
+  stat_cond <- if (file.exists(stat_path)) fread(stat_path) else NULL
+
+  for (pw in unique(scores_long$pathway)) {
+    sub <- scores_long[pathway == pw & condition %in% c("Normal","Tumor")]
+    if (nrow(sub) < 6) next
+    pval <- NA
+    if (!is.null(stat_cond)) {
+      pval <- stat_cond[pathway == pw, padj][1]
+    }
+    ttl <- sprintf("%s — Tumor vs Normal (BH p=%s)", pw,
+                   ifelse(is.na(pval), "NA", formatC(pval, format="e", digits=2)))
+
+    p <- ggplot(sub, aes(x = condition, y = score)) +
+      geom_violin(trim = FALSE, alpha = 0.6) +
+      geom_boxplot(width = 0.2, outlier.shape = NA) +
+      labs(title = ttl, x = "", y = "rank-mean score")
+
+    out_png <- here("plots","sphingo", sprintf("rankmean_%s_condition.png", gsub("[^A-Za-z0-9]+","_", pw)))
+    out_pdf <- here("plots","sphingo", sprintf("rankmean_%s_condition.pdf", gsub("[^A-Za-z0-9]+","_", pw)))
+    ggsave(out_png, plot = p, width = 6, height = 4, dpi = 300)
+    invisible(safe_pdf(out_pdf, p, 6, 4))
+  }
+  cat("[Plots] Tumor vs Normal PNG/PDF per-pathway written to plots/sphingo\n")
+} else {
+  cat("[Plots] Skipped Tumor vs Normal (missing or incomplete 'condition')\n")
+}
+
+# ---------- B) HG vs LG (tumor-only) ----------
+if ("grade_group" %in% names(scores_long) &&
+    all(c("LG","HG") %in% unique(na.omit(scores_long$grade_group)))) {
+
+  stat_path2 <- here("results","sphingo","rankmean_stats_grade.tsv")
+  stat_grade <- if (file.exists(stat_path2)) fread(stat_path2) else NULL
+
+  tum <- scores_long[!is.na(grade_group) & grade_group %in% c("LG","HG")]
+  for (pw in unique(tum$pathway)) {
+    sub <- tum[pathway == pw]
+    if (nrow(sub) < 6) next
+    pval <- NA
+    if (!is.null(stat_grade)) {
+      pval <- stat_grade[pathway == pw, padj][1]
+    }
+    ttl <- sprintf("%s — HG vs LG (BH p=%s)", pw,
+                   ifelse(is.na(pval), "NA", formatC(pval, format="e", digits=2)))
+
+    p <- ggplot(sub, aes(x = grade_group, y = score)) +
+      geom_violin(trim = FALSE, alpha = 0.6) +
+      geom_boxplot(width = 0.2, outlier.shape = NA) +
+      labs(title = ttl, x = "", y = "rank-mean score")
+
+    out_png <- here("plots","sphingo", sprintf("rankmean_%s_grade.png", gsub("[^A-Za-z0-9]+","_", pw)))
+    out_pdf <- here("plots","sphingo", sprintf("rankmean_%s_grade.pdf", gsub("[^A-Za-z0-9]+","_", pw)))
+    ggsave(out_png, plot = p, width = 6, height = 4, dpi = 300)
+    invisible(safe_pdf(out_pdf, p, 6, 4))
+  }
+  cat("[Plots] HG vs LG PNG/PDF per-pathway written to plots/sphingo\n")
+} else {
+  cat("[Plots] Skipped HG vs LG (missing or incomplete 'grade_group')\n")
+}
+```
+
+rankmean_heatmap
+```{r rankmean_heatmap, message=FALSE}
+suppressPackageStartupMessages({
+  library(here); library(data.table); library(pheatmap)
+})
+
+dir.create(here("plots","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+# Preconditions
+stopifnot(exists("ss"), is.matrix(ss))
+stopifnot(exists("meta"))
+stopifnot(identical(colnames(ss), meta$sample_id))
+
+# Z-score per pathway (row-wise)
+ss_z <- t(scale(t(ss)))
+
+# Column annotations
+ann_col <- data.frame(
+  condition   = if ("condition" %in% names(meta)) meta$condition else NA,
+  grade_group = if ("grade_group" %in% names(meta)) meta$grade_group else NA
+)
+rownames(ann_col) <- meta$sample_id
+stopifnot(identical(colnames(ss_z), rownames(ann_col)))
+
+# Write PNG + PDF
+png_file <- here("plots","sphingo","rankmean_heatmap.png")
+pdf_file <- here("plots","sphingo","rankmean_heatmap.pdf")
+
+pheatmap(ss_z,
+         annotation_col = ann_col,
+         show_rownames = TRUE,
+         filename = png_file,
+         width = 8, height = 10)
+
+pheatmap(ss_z,
+         annotation_col = ann_col,
+         show_rownames = TRUE,
+         filename = pdf_file,
+         width = 8, height = 10)
+
+cat("[Heatmap] Wrote:\n ", png_file, "\n ", pdf_file, "\n")
+
+```
+rankmean_heatmap_alt
+```{r rankmean_heatmap_alt, message=FALSE}
+suppressPackageStartupMessages({ library(here); library(data.table); library(pheatmap) })
+dir.create(here("plots","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+# Preconditions
+stopifnot(exists("ss"), is.matrix(ss))
+stopifnot(exists("meta"))
+stopifnot(identical(colnames(ss), meta$sample_id))
+
+# Z-score per pathway (row-wise)
+ss_z <- t(scale(t(ss)))
+
+# Column annotations
+ann_col <- data.frame(
+  condition   = if ("condition" %in% names(meta))   meta$condition   else NA,
+  grade_group = if ("grade_group" %in% names(meta)) meta$grade_group else NA
+)
+rownames(ann_col) <- meta$sample_id
+stopifnot(identical(colnames(ss_z), rownames(ann_col)))
+
+# Write PNG + PDF with alternative names to avoid confusion
+png_file <- here("plots","sphingo","rankmean_heatmap_alt.png")
+pdf_file <- here("plots","sphingo","rankmean_heatmap_alt.pdf")
+
+pheatmap(ss_z, annotation_col = ann_col, show_rownames = TRUE,
+         filename = png_file, width = 8, height = 10)
+pheatmap(ss_z, annotation_col = ann_col, show_rownames = TRUE,
+         filename = pdf_file, width = 8, height = 10)
+
+cat("[RankMean] Alt heatmap written:\n ", png_file, "\n ", pdf_file, "\n")
+```
+r rankmean_facets,
+```{r rankmean_facets, message=FALSE}
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2) })
+dir.create(here("plots","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+# Preconditions
+stopifnot(exists("ss"), is.matrix(ss), exists("meta"))
+stopifnot(identical(colnames(ss), meta$sample_id))
+
+# Long table (samples × pathways)
+scores_long <- as.data.table(t(ss), keep.rownames = "sample_id")
+scores_long <- melt(scores_long, id.vars = "sample_id",
+                    variable.name = "pathway", value.name = "score")
+scores_long <- merge(scores_long, as.data.table(meta), by = "sample_id", all.x = TRUE)
+
+# Helper: write PDFs robustly
+safe_pdf <- function(path_pdf, plot, w=11, h=8){
+  ok <- FALSE
+  try({ ggsave(path_pdf, plot=plot, width=w, height=h, device=cairo_pdf)
+       if (file.exists(path_pdf) && file.info(path_pdf)$size>0) ok <- TRUE }, silent=TRUE)
+  if (!ok) try({ pdf(path_pdf, width=w, height=h); print(plot); dev.off()
+                 if (file.exists(path_pdf) && file.info(path_pdf)$size>0) ok <- TRUE }, silent=TRUE)
+  invisible(ok)
+}
+
+# Helper: build facet figure for any two-level grouping variable
+facet_compare <- function(dat, xvar, title_txt, outfile_stub){
+  stopifnot(xvar %in% names(dat))
+  lev <- unique(na.omit(dat[[xvar]]))
+  if (length(lev) != 2) { message("[Facets] Skip ", xvar, " (need exactly 2 groups)"); return(invisible(NULL)) }
+
+  # Per-pathway Wilcoxon + BH
+  stats <- dat[get(xvar) %in% lev,
+    {
+      a <- score[get(xvar) == lev[1]]
+      b <- score[get(xvar) == lev[2]]
+      p <- if (length(a) > 2 && length(b) > 2) wilcox.test(a, b)$p.value else NA_real_
+      list(pval = p,
+           n1 = sum(get(xvar) == lev[1]),
+           n2 = sum(get(xvar) == lev[2]))
+    }, by = pathway]
+  stats[, padj := p.adjust(pval, method = "BH")]
+
+  labs <- stats[, .(pathway,
+                    facet_lab = sprintf("%s\nBH p=%s",
+                                        pathway,
+                                        ifelse(is.na(padj), "NA", formatC(padj, format="e", digits=2))))]
+
+  d <- merge(dat[get(xvar) %in% lev], labs, by = "pathway", all.x = TRUE)
+
+  p <- ggplot(d, aes_string(x = xvar, y = "score")) +
+    geom_violin(trim = FALSE, alpha = 0.55) +
+    geom_boxplot(width = 0.2, outlier.shape = NA) +
+    labs(title = title_txt, x = "", y = "Rank-mean score") +
+    facet_wrap(~ facet_lab, scales = "free_y") +
+    theme(strip.text = element_text(size = 9))
+
+  out_png <- here("plots","sphingo", paste0(outfile_stub, ".png"))
+  out_pdf <- here("plots","sphingo", paste0(outfile_stub, ".pdf"))
+  ggsave(out_png, plot = p, width = 11, height = 8, dpi = 300)
+  invisible(safe_pdf(out_pdf, p, 11, 8))
+  cat("[Facets]", title_txt, "->", out_png, "\n")
+}
+
+# A) Tumor vs Normal
+if ("condition" %in% names(scores_long) &&
+    all(c("Normal","Tumor") %in% unique(na.omit(scores_long$condition)))) {
+  facet_compare(scores_long, "condition",
+                "Sphingolipid rank-mean — Tumor vs Normal",
+                "rankmean_condition_facets")
+}
+
+# B) HG vs LG (tumors with grade_group)
+if ("grade_group" %in% names(scores_long) &&
+    all(c("LG","HG") %in% unique(na.omit(scores_long$grade_group)))) {
+  tum <- scores_long[grade_group %in% c("LG","HG")]
+  facet_compare(tum, "grade_group",
+                "Sphingolipid rank-mean — HG vs LG",
+                "rankmean_grade_facets")
+}
+
+# C) HG vs Normal (if both present)
+scores_long[, group3 := fifelse(condition == "Normal", "Normal",
+                         fifelse(grade_group %in% c("LG","HG"), as.character(grade_group), NA_character_))]
+scores_long[, group3 := factor(group3, levels = c("Normal","LG","HG"))]
+
+if (all(c("Normal","HG") %in% unique(na.omit(scores_long$group3)))) {
+  dat_hgN <- scores_long[group3 %in% c("Normal","HG")]
+  facet_compare(dat_hgN, "group3",
+                "Sphingolipid rank-mean — HG vs Normal",
+                "rankmean_HG_vs_Normal_facets")
+}
+
+# D) LG vs Normal (if both present)
+if (all(c("Normal","LG") %in% unique(na.omit(scores_long$group3)))) {
+  dat_lgN <- scores_long[group3 %in% c("Normal","LG")]
+  facet_compare(dat_lgN, "group3",
+                "Sphingolipid rank-mean — LG vs Normal",
+                "rankmean_LG_vs_Normal_facets")
+}
+```
+rankmean_heatmap2
+```{r rankmean_heatmap2, message=FALSE}
+suppressPackageStartupMessages({ library(here); library(data.table); library(pheatmap) })
+dir.create(here("plots","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+# Preconditions
+stopifnot(exists("ss"), is.matrix(ss), exists("meta"))
+stopifnot(identical(colnames(ss), meta$sample_id))
+
+# Z-score per pathway (row-wise)
+ss_z <- t(scale(t(ss)))
+
+# Column annotations
+ann_col <- data.frame(
+  condition   = if ("condition" %in% names(meta))   meta$condition   else NA,
+  grade_group = if ("grade_group" %in% names(meta)) meta$grade_group else NA
+)
+rownames(ann_col) <- meta$sample_id
+stopifnot(identical(colnames(ss_z), rownames(ann_col)))
+
+# Write PNG + PDF
+png_file <- here("plots","sphingo","rankmean_heatmap.png")
+pdf_file <- here("plots","sphingo","rankmean_heatmap.pdf")
+
+pheatmap(ss_z, annotation_col = ann_col, show_rownames = TRUE,
+         filename = png_file, width = 8, height = 10)
+pheatmap(ss_z, annotation_col = ann_col, show_rownames = TRUE,
+         filename = pdf_file, width = 8, height = 10)
+
+cat("[RankMean] Heatmap written:\n ", png_file, "\n ", pdf_file, "\n")
+
+```
+Evaluating DE sphingolipid genes
+```{r sphingo_bubble_plots, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(here); library(data.table); library(ggplot2)
+})
+
+dir.create(here("plots","sphingo"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+# ------------------------------
+# Parameters (tune as needed)
+# ------------------------------
+labels <- c("ccrcc_vs_normal_kidney",
+            "hg_vs_lg_ccrcc",
+            "hg_ccrcc_vs_normal_kidney",
+            "lg_ccrcc_vs_normal_kidney")
+
+fdr_thr <- 0.05             # significance threshold for a DE gene
+fc_thr  <- log2(1.5)        # absolute log2FC threshold for "meaningful" change
+min_sig_per_pathway <- 3    # a pathway is "altered" if it has >= this many significant genes (per comparison)
+top_k_per_pathway   <- 10   # cap number of genes shown per pathway to keep plots readable
+
+# ------------------------------
+# Sphingolipid sets + alias rescue
+# ------------------------------
+if (!exists("sphingo_sets")) {
+  ceramide_de_novo <- c("CERS1","CERS2","CERS3","CERS4","CERS5","CERS6","DEGS1","DEGS2")
+  salvage_catabolic_pathway_ceramide <- c("ASAH1","ASAH2","ACER1","ACER2","ACER3","SGPP1","SGPP2","SGPL1","GBA1","GBA2","GBA3","GLA","GLB1")
+  sphingomyelin_metabolism <- c("SGMS1","SGMS2","SMPD1","SMPD2","SMPD3","SMPD4","ENPP7")
+  glycosphingolipid_biosynthesis <- c("UGCG","UGT8","B3GALNT1","B3GALT4","B3GNT5","B4GALNT1","B4GALT5","B4GALT6","ST3GAL2","ST3GAL3","ST3GAL5","ST6GALNAC5","ST6GALNAC6","ST8SIA5","FUT1","FUT2","GALC","GAL3ST1")
+  ceramide_transport_regulation <- c("CERT1","OSBP","VAPA","VAPB","ORMDL1","ORMDL2","ORMDL3")
+  S1P_signaling <- c("SPHK1","SPHK2","SPNS2")
+  lipid_phosphatase_modifiers <- c("PLPP1","PLPP2","PLPP3","PPM1L","PRKD1","PRKD2","PRKD3")
+  sulfurylation_lysosomal_processing <- c("ARSA","ARSB","ARSD","ARSF","ARSG","ARSH","ARSI","ARSJ","ARSK","ARSL","SUMF1","SUMF2","PSAP","CTSA","GM2A","HEXA","HEXB","M6PR")
+  other_genes <- c("A4GALT","ABCC1","ABCG2","ALDH3A2","ALDH3B1","ALDH3B2","CERK","CSNK1G2","CYB5B","FA2H","GLB1L","GLB1L2","GLB1L3","MFSD2B","NEU1","NEU2","NEU3","NEU4","SAMD8","STS")
+  sphingo_sets <- list(
+    ceramide_de_novo = ceramide_de_novo,
+    salvage_catabolic_pathway_ceramide = salvage_catabolic_pathway_ceramide,
+    sphingomyelin_metabolism = sphingomyelin_metabolism,
+    glycosphingolipid_biosynthesis = glycosphingolipid_biosynthesis,
+    ceramide_transport_regulation = ceramide_transport_regulation,
+    S1P_signaling = S1P_signaling,
+    lipid_phosphatase_modifiers = lipid_phosphatase_modifiers,
+    sulfurylation_lysosomal_processing = sulfurylation_lysosomal_processing,
+    other_genes = other_genes
+  )
+}
+alias_map <- c("GBA1"="GBA","LASS1"="CERS1","LASS3"="CERS3")
+
+# gene ↔ subpathway map
+gene2set <- rbindlist(lapply(names(sphingo_sets), function(nm) {
+  data.table(gene = sphingo_sets[[nm]], subpathway = nm)
+}))
+gene2set[, gene := ifelse(gene %in% names(alias_map), alias_map[gene], gene)]
+gene2set <- unique(gene2set, by = c("gene","subpathway"))
+sphingo_union <- unique(gene2set$gene)
+
+# ------------------------------
+# DE table normalization helper
+# ------------------------------
+normalize_de <- function(dt){
+  setDT(dt)
+  if (!"logFC" %in% names(dt)) {
+    cand <- intersect(c("logFC","log2FC","LogFC","LFC"), names(dt))
+    if (length(cand)) setnames(dt, cand[1], "logFC")
+  }
+  if (!"FDR" %in% names(dt)) {
+    cand <- intersect(c("FDR","padj","adj.P.Val","qvalue","q.val","q"), names(dt))
+    if (length(cand)) setnames(dt, cand[1], "FDR")
+  }
+  if (!"gene_name" %in% names(dt)) {
+    cand <- intersect(c("gene_name","symbol","SYMBOL","gene","hgnc_symbol"), names(dt))
+    if (length(cand)) setnames(dt, cand[1], "gene_name")
+    else if ("gene_id" %in% names(dt)) dt[, gene_name := gene_id]
+  }
+  # types + alias rescue
+  dt[, gene_name := ifelse(gene_name %in% names(alias_map), alias_map[gene_name], gene_name)]
+  dt[, logFC := suppressWarnings(as.numeric(logFC))]
+  if ("FDR" %in% names(dt)) dt[, FDR := suppressWarnings(as.numeric(FDR))] else dt[, FDR := NA_real_]
+  dt
+}
+
+load_de_for_label <- function(label){
+  # prefer the sphingolipid subset if present
+  f_sub <- here("results","sphingo", sprintf("kirc_%s_DE_sphingolipid_subset.csv", label))
+  if (file.exists(f_sub)) {
+    dt <- tryCatch(fread(f_sub), error = function(e) NULL)
+    if (!is.null(dt)) return(normalize_de(dt))
+  }
+  # fall back to full DE and subset to sphingolipid genes
+  f_full <- here("results", sprintf("kirc_%s_limma.csv", label))
+  if (!file.exists(f_full)) return(NULL)
+  dt <- tryCatch(fread(f_full), error = function(e) NULL)
+  if (is.null(dt)) return(NULL)
+  dt <- normalize_de(dt)
+  dt[gene_name %in% sphingo_union]
+}
+
+# ------------------------------
+# Plot helper
+# ------------------------------
+safe_pdf <- function(path_pdf, plot, w=10, h=7){
+  ok <- FALSE
+  try({ ggsave(path_pdf, plot=plot, width=w, height=h, device=cairo_pdf)
+       if (file.exists(path_pdf) && file.info(path_pdf)$size>0) ok <- TRUE }, silent=TRUE)
+  if (!ok) try({ pdf(path_pdf, width=w, height=h); print(plot); dev.off()
+                 if (file.exists(path_pdf) && file.info(path_pdf)$size>0) ok <- TRUE }, silent=TRUE)
+  invisible(ok)
+}
+
+make_bubble <- function(df, label){
+  # significance + pathway selection
+  df[, sig := is.finite(FDR) & FDR < fdr_thr & is.finite(logFC) & abs(logFC) >= fc_thr]
+  # attach subpathway
+  sub <- merge(df, gene2set, by.x = "gene_name", by.y = "gene", all.x = FALSE, all.y = FALSE)
+
+  # which pathways are "altered" for this comparison?
+  path_counts <- sub[, .(sig_n = sum(sig, na.rm=TRUE), total = .N), by = subpathway]
+  altered <- path_counts[sig_n >= min_sig_per_pathway, subpathway]
+  if (!length(altered)) {
+    message("[Bubble] ", label, ": no pathways meet altered criteria (≥ ", min_sig_per_pathway, " sig genes) — plotting top pathways by signal instead.")
+    # if none pass, pick up to 4 most active by #sig (or by total if no sig at all)
+    pick <- head(path_counts[order(-sig_n, -total)], 4L)$subpathway
+    altered <- pick
+  }
+
+  sub2 <- sub[subpathway %in% altered]
+  if (!nrow(sub2)) { message("[Bubble] ", label, ": nothing to plot."); return(invisible(NULL)) }
+
+  # within each pathway, take top_k genes by FDR (asc) then |logFC| (desc)
+  sub2[, abs_fc := abs(logFC)]
+  setorder(sub2, subpathway, FDR, -abs_fc)
+  sub2 <- sub2[, head(.SD, top_k_per_pathway), by = subpathway]
+  sub2[, gene_name := factor(gene_name, levels = rev(unique(gene_name)))]
+
+  # point size by -log10(FDR); cap to be reasonable
+  sub2[, mlog10 := -log10(pmax(FDR, 1e-300))]
+  # build plot
+  p <- ggplot(sub2, aes(x = subpathway, y = gene_name)) +
+    geom_point(aes(size = mlog10, fill = logFC), shape = 21, alpha = 0.85, stroke = 0.3) +
+    scale_y_discrete(drop = FALSE) +
+    scale_x_discrete(drop = FALSE) +
+    scale_size_continuous(name = expression(-log[10]~FDR)) +
+    scale_fill_gradient2(name = "log2FC", low = "blue", mid = "white", high = "red", midpoint = 0) +
+    labs(
+      title = paste0("Sphingolipid DE — Bubble plot: ", label),
+      subtitle = paste0("Criteria: FDR<", fdr_thr, " & |log2FC|>=", round(fc_thr, 2),
+                        "; pathways shown require ≥", min_sig_per_pathway, " significant genes"),
+      x = "Subpathway", y = "Gene"
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      axis.text.x = element_text(angle = 30, hjust = 1),
+      panel.grid.major.x = element_blank()
+    )
+
+  out_png <- here("plots","sphingo", sprintf("%s_sphingo_bubble.png", label))
+  out_pdf <- here("plots","sphingo", sprintf("%s_sphingo_bubble.pdf", label))
+  ggsave(out_png, plot = p, width = 10, height = max(5, length(levels(sub2$gene_name))*0.18), dpi = 300)
+  invisible(safe_pdf(out_pdf, p, w = 10, h = max(5, length(levels(sub2$gene_name))*0.18)))
+  message("[Bubble] Wrote: ", basename(out_png))
+  invisible(list(data = sub2, plot = p))
+}
+
+# ------------------------------
+# Produce per-contrast bubble plots
+# ------------------------------
+bubble_data <- list()
+for (lb in labels) {
+  dt <- load_de_for_label(lb)
+  if (is.null(dt) || !nrow(dt)) { message("[Bubble] Skip ", lb, " (no DE rows)."); next }
+  res <- make_bubble(dt, lb)
+  bubble_data[[lb]] <- res$data
+}
+
+# ------------------------------
+# OPTIONAL: combined faceted bubble (all comparisons)
+# ------------------------------
+comb <- rbindlist(lapply(names(bubble_data), function(lb){
+  if (is.null(bubble_data[[lb]])) return(NULL)
+  cbind(bubble_data[[lb]], contrast = lb)
+}), fill = TRUE)
+
+if (!is.null(comb) && nrow(comb)) {
+  comb$gene_name <- factor(comb$gene_name, levels = rev(unique(comb$gene_name)))
+  p_all <- ggplot(comb, aes(x = subpathway, y = gene_name)) +
+    geom_point(aes(size = mlog10, fill = logFC), shape = 21, alpha = 0.85, stroke = 0.3) +
+    scale_y_discrete(drop = FALSE) +
+    scale_x_discrete(drop = FALSE) +
+    scale_size_continuous(name = expression(-log[10]~FDR)) +
+    scale_fill_gradient2(name = "log2FC", low = "blue", mid = "white", high = "red", midpoint = 0) +
+    labs(title = "Sphingolipid DE — Bubble plots across comparisons",
+         x = "Subpathway", y = "Gene") +
+    facet_wrap(~ contrast, scales = "free_y") +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          panel.grid.major.x = element_blank())
+
+   out_png <- here("plots","sphingo","ALL_sphingo_bubbles_faceted.png")
+   out_pdf <- here("plots","sphingo","ALL_sphingo_bubbles_faceted.pdf")
+   ggsave(out_png, plot = p_all, width = 12, height = 8, dpi = 300)
+   invisible(safe_pdf(out_pdf, p_all, w = 12, h = 8))
+   message("[Bubble] Wrote combined faceted figure: ", basename(out_png))
+} else {
+  message("[Bubble] Combined faceted figure skipped (no data).")
+}
+```
+
+Global pathway summary analyses
+```{r sphingo_metaZ_helpers_and_first_run}
+suppressPackageStartupMessages({ library(here); library(data.table) })
+dir.create(here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+# 0) Sphingolipid sets (reuse if present; else create)
+if (!exists("sphingo_sets")) {
+  ceramide_de_novo <- c("CERS1","CERS2","CERS3","CERS4","CERS5","CERS6","DEGS1","DEGS2")
+  salvage_catabolic_pathway_ceramide <- c("ASAH1","ASAH2","ACER1","ACER2","ACER3","SGPP1","SGPP2","SGPL1","GBA1","GBA2","GBA3","GLA","GLB1")
+  sphingomyelin_metabolism <- c("SGMS1","SGMS2","SMPD1","SMPD2","SMPD3","SMPD4","ENPP7")
+  glycosphingolipid_biosynthesis <- c("UGCG","UGT8","B3GALNT1","B3GALT4","B3GNT5","B4GALNT1","B4GALT5","B4GALT6",
+                                       "ST3GAL2","ST3GAL3","ST3GAL5","ST6GALNAC5","ST6GALNAC6","ST8SIA5","FUT1","FUT2","GALC","GAL3ST1")
+  ceramide_transport_regulation <- c("CERT1","OSBP","VAPA","VAPB","ORMDL1","ORMDL2","ORMDL3")
+  S1P_signaling <- c("SPHK1","SPHK2","SPNS2")
+  lipid_phosphatase_modifiers <- c("PLPP1","PLPP2","PLPP3","PPM1L","PRKD1","PRKD2","PRKD3")
+  sulfurylation_lysosomal_processing <- c("ARSA","ARSB","ARSD","ARSF","ARSG","ARSH","ARSI","ARSJ","ARSK","ARSL","SUMF1","SUMF2","PSAP","CTSA","GM2A","HEXA","HEXB","M6PR")
+  other_genes <- c("A4GALT","ABCC1","ABCG2","ALDH3A2","ALDH3B1","ALDH3B2","CERK","CSNK1G2","CYB5B","FA2H",
+                   "GLB1L","GLB1L2","GLB1L3","MFSD2B","NEU1","NEU2","NEU3","NEU4","SAMD8","STS")
+  sphingo_sets <- list(
+    de_novo_ceramide_biosynthesis = ceramide_de_novo,
+    salvage_catabolic_pathway_ceramide = salvage_catabolic_pathway_ceramide,
+    sphingomyelin_metabolism = sphingomyelin_metabolism,
+    glycosphingolipid_biosynthesis = glycosphingolipid_biosynthesis,
+    ceramide_transport_regulation = ceramide_transport_regulation,
+    S1P_signaling = S1P_signaling,
+    lipid_phosphatase_modifiers = lipid_phosphatase_modifiers,
+    sulfurylation_lysosomal_processing = sulfurylation_lysosomal_processing,
+    other_genes = other_genes
+  )
+}
+alias_map <- c("GBA1"="GBA","LASS1"="CERS1","LASS3"="CERS3")
+
+# 1) Load + normalize a DE table
+load_de_normalized <- function(label){
+  f <- here("results", sprintf("kirc_%s_limma.csv", label))
+  if (!file.exists(f)) stop("Missing DE file: ", f)
+  dt <- data.table::fread(f)
+  setDT(dt)
+
+  # Harmonize columns
+  if (!"gene_name" %in% names(dt)) {
+    cand <- intersect(c("gene_name","symbol","SYMBOL","gene","hgnc_symbol"), names(dt))
+    if (length(cand)) setnames(dt, cand[1], "gene_name")
+  }
+  if (!"logFC" %in% names(dt)) {
+    cand <- intersect(c("logFC","log2FC","LogFC","LFC"), names(dt))
+    if (length(cand)) setnames(dt, cand[1], "logFC")
+  }
+  pcol <- intersect(c("P.Value","pvalue","pval","PValue","P"), names(dt))
+  if (length(pcol)) setnames(dt, pcol[1], "P.Value")
+
+  # Fallbacks for P.Value if needed
+  if (!"P.Value" %in% names(dt)) {
+    if ("t" %in% names(dt) && any(is.finite(dt$t))) {
+      ord <- rank(-abs(dt$t), ties.method = "average", na.last = "keep")
+      n   <- sum(is.finite(dt$t))
+      dt[, P.Value := (ord + 1) / (n + 1)]
+    } else if ("FDR" %in% names(dt)) {
+      ord <- rank(dt$FDR, ties.method = "average", na.last = "keep")
+      n   <- sum(is.finite(dt$FDR))
+      dt[, P.Value := (ord + 1) / (n + 1)]
+    } else stop("No p-values, t, or FDR columns found in: ", f)
+  }
+
+  # Types + alias rescue
+  suppressWarnings({
+    if ("logFC" %in% names(dt)) dt[, logFC := as.numeric(logFC)]
+    dt[, P.Value := as.numeric(P.Value)]
+  })
+  if (!"gene_name" %in% names(dt) && "gene_id" %in% names(dt)) dt[, gene_name := gene_id]
+  dt[, gene_name := ifelse(gene_name %in% names(alias_map), alias_map[gene_name], gene_name)]
+
+  # Keep necessary cols
+  keep <- intersect(c("gene_name","logFC","P.Value","FDR","t"), names(dt))
+  dt <- unique(dt[, ..keep])
+  dt <- dt[is.finite(P.Value) & nzchar(gene_name)]
+  dt
+}
+
+# 2) Meta-Z per subpathway
+meta_z_one <- function(dt, genes, trim_abs_z = 8, min_genes = 5) {
+  sub <- dt[gene_name %in% genes & is.finite(logFC) & is.finite(P.Value)]
+  if (nrow(sub) < min_genes) {
+    return(list(n=nrow(sub), Z=NA_real_, p=NA_real_, direction=NA_character_, consistency=NA_real_))
+  }
+  z0 <- qnorm(pmax(1e-300, 1 - (sub$P.Value/2))) * sign(sub$logFC)
+  z0 <- pmax(pmin(z0, trim_abs_z), -trim_abs_z)
+  w  <- sqrt(pmax( -log10(pmax(sub$P.Value, 1e-300)), 1e-6))
+  Z  <- sum(w * z0) / sqrt(sum(w^2))
+  p  <- 2*pnorm(-abs(Z))
+  dir <- ifelse(Z > 0, "Up", "Down")
+  cons <- mean(sign(sub$logFC) == sign(Z))
+  list(n=nrow(sub), Z=as.numeric(Z), p=as.numeric(p), direction=dir, consistency=as.numeric(cons))
+}
+
+# 3) Run meta-Z for a label; write TSV
+run_meta_z_for_label <- function(label, sets = sphingo_sets, q_method = "BH") {
+  dt <- load_de_normalized(label)
+  res <- lapply(names(sets), function(nm) {
+    gs <- ifelse(sets[[nm]] %in% names(alias_map), alias_map[sets[[nm]]], sets[[nm]])
+    mz <- meta_z_one(dt, gs)
+    data.frame(subpathway = nm, n = mz$n, Z = mz$Z, p = mz$p,
+               direction = mz$direction, consistency = mz$consistency, stringsAsFactors = FALSE)
+  })
+  out <- data.table::rbindlist(res)
+  out[, q := p.adjust(p, method = q_method)]
+  out[, call := fifelse(is.finite(q) & q < 0.05 & is.finite(Z) & Z > 0 & consistency >= 0.6, "Up",
+                 fifelse(is.finite(q) & q < 0.05 & is.finite(Z) & Z < 0 & consistency >= 0.6, "Down",
+                 fifelse(is.finite(q) & q < 0.05 & is.finite(Z) & consistency < 0.6, "Mixed", "NS")))]
+  outf <- here("results","sphingo", sprintf("metaZ_%s.tsv", label))
+  fwrite(out, outf, sep = "\t")
+  message("[metaZ] Wrote: ", outf)
+  out[order(q, -abs(Z))]
+}
+
+# 4) First run: Tumor vs Normal
+label_first <- "ccrcc_vs_normal_kidney"
+metaZ_ccrcc_vs_normal <- run_meta_z_for_label(label_first)
+print(metaZ_ccrcc_vs_normal)
+```
+
+Sphingo metaz all
+```{r sphingo_metaZ_all_and_plot}
+# ---- sphingo_metaZ_all_and_plot ----
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2) })
+dir.create(here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here("plots","sphingo"),   recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(exists("run_meta_z_for_label"))
+
+labels <- c("ccrcc_vs_normal_kidney",
+            "hg_vs_lg_ccrcc",
+            "hg_ccrcc_vs_normal_kidney",
+            "lg_ccrcc_vs_normal_kidney")
+
+# 1) Run meta-z for all contrasts and bind
+metaZ_list <- lapply(labels, function(lb) {
+  out <- run_meta_z_for_label(lb)
+  out$contrast <- lb
+  out
+})
+metaZ_all <- rbindlist(metaZ_list, fill = TRUE)
+out_all <- here("results","sphingo","metaZ_all_contrasts.tsv")
+fwrite(metaZ_all, out_all, sep = "\t")
+cat("[metaZ] Wrote combined table:", out_all, "\n")
+
+# 2) Compact summary plot (subpathway × contrast)
+#    - Fill: signed Z (truncated to [-6,6])
+#    - Size: -log10(q)
+#    - Shape: call (Up/Down/Mixed/NS)
+metaZ_all[, Z_cap := pmax(pmin(Z, 6), -6)]
+metaZ_all[, mlog10q := -log10(pmax(q, .Machine$double.xmin))]
+metaZ_all[, call := factor(call, levels = c("Down","Mixed","Up","NS"))]
+
+# nicer labels
+lab_map <- c(
+  ccrcc_vs_normal_kidney    = "Tumor vs Normal",
+  hg_vs_lg_ccrcc            = "HG vs LG",
+  hg_ccrcc_vs_normal_kidney = "HG vs Normal",
+  lg_ccrcc_vs_normal_kidney = "LG vs Normal"
+)
+metaZ_all[, contrast_lab := factor(lab_map[contrast], levels = lab_map[labels])]
+
+p <- ggplot(metaZ_all, aes(x = contrast_lab, y = subpathway)) +
+  geom_tile(aes(fill = Z_cap), alpha = 0.85) +
+  geom_point(aes(size = mlog10q, shape = call)) +
+  scale_size_continuous(name = expression(-log[10](q)), range = c(1.2, 5)) +
+  scale_shape_manual(values = c(25, 21, 24, 4), name = "Call") +
+  scale_fill_gradient2(name = "meta-Z", limits = c(-6, 6), oob = scales::squish) +
+  labs(title = "Sphingolipid subpathways — meta-Z summary across contrasts",
+       x = "", y = "") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 0, hjust = 0.5),
+        legend.position = "right")
+
+# 3) Save
+out_png <- here("plots","sphingo","metaZ_summary_subpathways.png")
+out_pdf <- here("plots","sphingo","metaZ_summary_subpathways.pdf")
+ggsave(out_png, p, width = 9, height = max(4.5, 0.35*length(unique(metaZ_all$subpathway)) + 1), dpi = 300)
+
+ok <- FALSE
+try({
+  ggsave(out_pdf, p, width = 9, height = max(4.5, 0.35*length(unique(metaZ_all$subpathway)) + 1), device = cairo_pdf)
+  if (file.exists(out_pdf) && file.info(out_pdf)$size > 0) ok <- TRUE
+}, silent = TRUE)
+if (!ok) try({
+  grDevices::pdf(out_pdf, width = 9, height = max(4.5, 0.35*length(unique(metaZ_all$subpathway)) + 1), useDingbats = FALSE)
+  print(p); grDevices::dev.off()
+}, silent = TRUE)
+
+cat("[metaZ] Plot ->", out_png, if (file.exists(out_pdf)) paste("|", out_pdf) else "", "\n")
+```
+
+Rankmean by subpathway
+```{r rankmean_by_subpathway_compute}
+# ---- rankmean_by_subpathway_compute ----
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2) })
+dir.create(here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+# Preconditions from previous chunks:
+# - 'sphingo_sets' : named list of gene symbols per subpathway
+# - 'alias_map'    : named vector for symbol rescue (e.g., GBA1 -> GBA)
+stopifnot(exists("sphingo_sets"))
+if (!exists("alias_map")) alias_map <- c("GBA1" = "GBA", "LASS1" = "CERS1", "LASS3" = "CERS3")
+
+# Helper: load + normalize DE for a contrast
+normalize_de_for_rankmean <- function(label) {
+  f <- here("results", sprintf("kirc_%s_limma.csv", label))
+  if (!file.exists(f)) stop("[rank-mean] Missing DE file: ", basename(f))
+  dt <- data.table::fread(f)
+  setDT(dt)
+
+  # Standardize columns
+  if (!"logFC" %in% names(dt)) {
+    cand <- intersect(c("logFC","log2FC","LogFC","LFC"), names(dt))
+    if (length(cand)) setnames(dt, cand[1], "logFC")
+  }
+  if (!"t" %in% names(dt)) {
+    cand <- intersect(c("t","t_stat","t.value","T"), names(dt))
+    if (length(cand)) setnames(dt, cand[1], "t")
+  }
+  if (!"gene_name" %in% names(dt)) {
+    cand <- intersect(c("gene_name","symbol","SYMBOL","gene","hgnc_symbol"), names(dt))
+    if (length(cand)) setnames(dt, cand[1], "gene_name")
+  }
+  if (!"gene_name" %in% names(dt) && "gene_id" %in% names(dt)) {
+    dt[, gene_name := sub("\\.\\d+$", "", gene_id)]
+  }
+
+  # Coerce types
+  suppressWarnings({
+    if ("logFC" %in% names(dt)) dt[, logFC := as.numeric(logFC)]
+    if ("t"     %in% names(dt)) dt[, t     := as.numeric(t)]
+  })
+
+  # Keep only what we need
+  keep <- intersect(c("gene_name","logFC","t"), names(dt))
+  dt <- dt[, ..keep]
+
+  # Alias rescue on gene_name
+  dt[, gene_name := ifelse(gene_name %in% names(alias_map), alias_map[gene_name], gene_name)]
+
+  # Drop rows without usable stats
+  dt <- dt[is.finite(logFC) | is.finite(t)]
+  dt
+}
+
+# Core rank-mean calculator
+rankmean_for_label <- function(label, nperm = 2000, use_stat = c("t","logFC")) {
+  use_stat <- match.arg(use_stat)
+  dt <- normalize_de_for_rankmean(label)
+
+  # Universe = union of all sphingolipid genes (after alias)
+  sphingo_union <- unique(unlist(sphingo_sets, use.names = FALSE))
+  sphingo_union <- ifelse(sphingo_union %in% names(alias_map), alias_map[sphingo_union], sphingo_union)
+
+  # Subset DE to the sphingolipid universe
+  U <- dt[gene_name %in% sphingo_union & is.finite(logFC)]
+  if (use_stat == "t" && "t" %in% names(U) && any(is.finite(U$t))) {
+    U <- U[is.finite(t)]
+    mag <- abs(U$t)
+    sgn <- sign(U$logFC)  # direction from logFC
+  } else {
+    mag <- abs(U$logFC)
+    sgn <- sign(U$logFC)
+  }
+  if (nrow(U) < 5) stop("[rank-mean] Too few sphingolipid genes with stats in ", label)
+
+  # Rank by magnitude across union, scale to (0,1], signed by logFC
+  r <- rank(mag, ties.method = "average")
+  r_scaled <- r / max(r)
+  eff <- sgn * r_scaled
+  U[, eff := eff]
+
+  # Fast lookup
+  eff_vec <- setNames(U$eff, U$gene_name)
+  genes_all <- names(eff_vec)
+  N <- length(eff_vec)
+
+  # For each subpathway, obs mean(eff); permute for p-value
+  out <- rbindlist(lapply(names(sphingo_sets), function(sp) {
+    gs <- sphingo_sets[[sp]]
+    gs <- ifelse(gs %in% names(alias_map), alias_map[gs], gs)
+    gs <- intersect(gs, genes_all)
+    k <- length(gs)
+    if (k < 3) {
+      data.table(subpathway = sp, k = k, rankmean = NA_real_, p = NA_real_)
+    } else {
+      obs <- mean(eff_vec[gs])
+
+      set.seed(1234)
+      B <- nperm
+      bsz <- 500
+      gt_eq <- 0L
+      for (i in seq_len(ceiling(B/bsz))) {
+        m <- if (i < ceiling(B/bsz)) bsz else (B - bsz*(i-1))
+        samp_idx <- replicate(m, sample.int(N, k, replace = FALSE))
+        null_means <- colMeans(matrix(eff_vec[samp_idx], nrow = k))
+        gt_eq <- gt_eq + sum(abs(null_means) >= abs(obs))
+      }
+      pval <- (gt_eq + 1) / (B + 1)
+
+      data.table(subpathway = sp, k = k, rankmean = obs, p = pval)
+    }
+  }))
+
+  out[, q := p.adjust(p, method = "BH")]
+  out[, contrast := label]
+  out[, call := fifelse(is.finite(rankmean) & q < 0.05 & rankmean > 0, "Up",
+                 fifelse(is.finite(rankmean) & q < 0.05 & rankmean < 0, "Down", "NS"))]
+  out[]
+}
+
+# Run for all contrasts and write individual + combined tables
+labels <- c("ccrcc_vs_normal_kidney",
+            "hg_vs_lg_ccrcc",
+            "hg_ccrcc_vs_normal_kidney",
+            "lg_ccrcc_vs_normal_kidney")
+
+rankmean_list <- lapply(labels, function(lb) {
+  x <- rankmean_for_label(lb, nperm = 2000, use_stat = "t")
+  out_f <- here("results","sphingo", sprintf("rankmean_%s.tsv", lb))
+  fwrite(x, out_f, sep = "\t")
+  message("[rank-mean] Wrote: ", basename(out_f))
+  x
+})
+rankmean_all <- rbindlist(rankmean_list, fill = TRUE)
+out_all <- here("results","sphingo","rankmean_all_contrasts.tsv")
+fwrite(rankmean_all, out_all, sep = "\t")
+cat("[rank-mean] Combined table ->", out_all, "\n")
+```
+
+Rankmean visualization
+```{r rankmean_visualize_subpathways}
+# ---- rankmean_visualize_subpathways ----
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2) })
+dir.create(here("plots","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+# Load combined table from prior chunk
+f_all <- here("results","sphingo","rankmean_all_contrasts.tsv")
+stopifnot(file.exists(f_all))
+RM <- data.table::fread(f_all)
+
+# Clean + derived fields
+RM[, contrast := factor(contrast,
+  levels = c("ccrcc_vs_normal_kidney","hg_vs_lg_ccrcc","hg_ccrcc_vs_normal_kidney","lg_ccrcc_vs_normal_kidney"),
+  labels = c("Tumor vs Normal","HG vs LG","HG vs Normal","LG vs Normal")
+)]
+RM[, mlog10q := -log10(pmax(q, .Machine$double.xmin))]
+RM[, sig := !is.na(q) & q < 0.05]
+RM[, dir := fifelse(rankmean > 0, "Up", "Down")]
+RM[, dir := factor(dir, levels = c("Down","Up"))]
+
+# Helper: safe PDF saver
+safe_pdf <- function(path_pdf, plot, w=8, h=6){
+  ok <- FALSE
+  try({ ggsave(path_pdf, plot=plot, width=w, height=h, device=cairo_pdf)
+       if (file.exists(path_pdf) && file.info(path_pdf)$size>0) ok <- TRUE }, silent=TRUE)
+  if (!ok) try({ pdf(path_pdf, width=w, height=h); print(plot); dev.off()
+                 if (file.exists(path_pdf) && file.info(path_pdf)$size>0) ok <- TRUE }, silent=TRUE)
+  invisible(ok)
+}
+
+# A) Bubble plots per contrast: x=subpathway, y=rankmean, size=-log10(q), color=direction
+for (cn in levels(RM$contrast)) {
+  sub <- RM[contrast == cn & is.finite(rankmean)]
+  if (!nrow(sub)) next
+
+  # order subpathways by effect size magnitude
+  sub[, ord := abs(rankmean)]
+  setorder(sub, ord)
+  sub[, subpathway := factor(subpathway, levels = unique(subpathway))]
+
+  p <- ggplot(sub, aes(x = subpathway, y = rankmean, size = mlog10q, color = dir)) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    geom_point(alpha = 0.85) +
+    coord_flip() +
+    scale_size_continuous(name = expression(-log[10]("q")), range = c(2, 8)) +
+    labs(
+      title = paste0("Subpathway direction — ", cn, " (rank-mean effect)"),
+      x = "", y = "Rank-mean effect"
+    ) +
+    guides(color = guide_legend(title = "Direction")) +
+    theme(axis.text.y = element_text(size = 9))
+
+  out_png <- here("plots","sphingo", sprintf("rankmean_bubble_%s.png", gsub("\\s+","_", tolower(cn))))
+  out_pdf <- here("plots","sphingo", sprintf("rankmean_bubble_%s.pdf",  gsub("\\s+","_", tolower(cn))))
+  ggsave(out_png, p, width = 8, height = max(5, 0.35*nrow(sub)+2), dpi = 300)
+  invisible(safe_pdf(out_pdf, p, w = 8, h = max(5, 0.35*nrow(sub)+2)))
+  cat("[Bubble] Wrote:", basename(out_png), "\n")
+}
+
+# B) Heatmap across contrasts: tiles = rankmean, point overlay for q<0.05
+HM <- RM[is.finite(rankmean)]
+if (nrow(HM)) {
+  # Keep consistent ordering by average magnitude
+  ord_sp <- HM[, .(ord = mean(abs(rankmean), na.rm = TRUE)), by = subpathway][order(ord)]$subpathway
+  HM[, subpathway := factor(subpathway, levels = ord_sp)]
+
+  p_hm <- ggplot(HM, aes(x = contrast, y = subpathway, fill = rankmean)) +
+    geom_tile(color = "grey90") +
+    geom_point(data = HM[sig == TRUE], aes(x = contrast, y = subpathway),
+               shape = 8, size = 1.7, inherit.aes = FALSE) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, name = "Rank-mean") +
+    labs(title = "Subpathway direction across contrasts (rank-mean)\n★ indicates q < 0.05",
+         x = "", y = "") +
+    theme(axis.text.y = element_text(size = 9))
+
+  out_png_hm <- here("plots","sphingo","rankmean_subpathway_heatmap.png")
+  out_pdf_hm <- here("plots","sphingo","rankmean_subpathway_heatmap.pdf")
+  ggsave(out_png_hm, p_hm, width = 8.5, height = max(5, 0.3*length(levels(HM$subpathway))+2), dpi = 300)
+  invisible(safe_pdf(out_pdf_hm, p_hm, w = 8.5, h = max(5, 0.3*length(levels(HM$subpathway))+2)))
+  cat("[Heatmap] Wrote:", basename(out_png_hm), "\n")
+} else {
+  message("[Heatmap] No finite rank-mean rows to plot.")
+}
+```
+
+Sphingo summary tables
+```{r}
+# ---- rebuild_rankmean_inputs ----
+suppressPackageStartupMessages({
+  library(here); library(data.table); library(SummarizedExperiment); library(edgeR)
+})
+
+# 1) Load config -> paths
+cfg_file <- here("results","kirc_sphingolipid_starter_config.tsv")
+stopifnot(file.exists(cfg_file))
+cfg <- fread(cfg_file)
+cfg_map <- setNames(cfg$path, cfg$cfg_key)
+
+# 2) Load bundle and build metadata (condition + grade_group)
+B <- readRDS(cfg_map["bundle_rds"])
+stopifnot(is.list(B), "se_clean_filtered" %in% names(B), "sample_meta" %in% names(B))
+se_filt <- B$se_clean_filtered
+assn    <- B$assay_name
+dge     <- B$dge_tmm
+stopifnot(inherits(se_filt, "SummarizedExperiment"), inherits(dge, "DGEList"))
+
+cts <- SummarizedExperiment::assay(se_filt, assn)
+meta <- as.data.frame(B$sample_meta)
+rownames(meta) <- colnames(cts)
+if (!"condition" %in% names(meta)) {
+  meta$condition <- factor(ifelse(meta$sample_type == "Solid Tissue Normal","Normal","Tumor"),
+                           levels = c("Normal","Tumor"))
+}
+
+# Robust grade parser
+parse_grade <- function(x){
+  x <- toupper(as.character(x))
+  x <- gsub("\\s+","", x)
+  ifelse(grepl("G3|G4|HIGH", x), "HG",
+         ifelse(grepl("G1|G2|LOW", x), "LG", NA_character_))
+}
+pick_first <- function(df, xs){ for (k in xs) if (k %in% names(df)) return(df[[k]]); return(NULL) }
+rawg <- pick_first(meta, c("tumor_grade","neoplasm_histologic_grade","grade","histologic_grade"))
+meta$grade_group <- factor(ifelse(meta$condition=="Tumor", parse_grade(rawg), NA_character_),
+                           levels = c("LG","HG"))
+
+# 3) Build logCPM (SYMBOL rows). If you already have logCPM_sym in memory, this keeps it.
+if (!exists("logCPM_sym")) {
+  # Make logCPM from DGE
+  logCPM_all <- edgeR::cpm(dge, log = TRUE, prior.count = 1)
+  # Map Ensembl -> SYMBOL using genes TSV
+  gmeta <- fread(cfg_map["genes_tsv"])
+  strip <- function(x) sub("[.][0-9]+$","", x)
+  if (!"gene_name" %in% names(gmeta)) gmeta[, gene_name := NA_character_]
+  gmeta[, gene_id_core := strip(gene_id)]
+  ens_core <- strip(rownames(logCPM_all))
+  sym_map <- gmeta[, .(gene_name = na.omit(gene_name[nzchar(gene_name)])[1]), by = gene_id_core]
+  symbol_vec <- sym_map$gene_name[match(ens_core, sym_map$gene_id_core)]
+  # fallback: keep Ensembl core if missing
+  symbol_vec[is.na(symbol_vec) | !nzchar(symbol_vec)] <- ens_core[is.na(symbol_vec) | !nzchar(symbol_vec)]
+  # Collapse duplicate symbols by column means
+  collapse_by_symbol <- function(M, syms){
+    keep <- nzchar(syms); M <- M[keep,,drop=FALSE]; syms <- syms[keep]
+    idx <- split(seq_along(syms), syms)
+    out <- lapply(idx, function(ix) if (length(ix)==1) M[ix,,drop=FALSE] else matrix(colMeans(M[ix,,drop=FALSE]), nrow=1))
+    mat <- do.call(rbind, out); rownames(mat) <- names(idx); colnames(mat) <- colnames(M); mat
+  }
+  logCPM_sym <- collapse_by_symbol(logCPM_all, symbol_vec)
+}
+
+# 4) Define sphingolipid sets (or reuse if present)
+if (!exists("sphingo_sets")) {
+  ceramide_de_novo <- c("CERS1","CERS2","CERS3","CERS4","CERS5","CERS6","DEGS1","DEGS2")
+  salvage_catabolic_pathway_ceramide <- c("ASAH1","ASAH2","ACER1","ACER2","ACER3","SGPP1","SGPP2","SGPL1","GBA1","GBA2","GBA3","GLA","GLB1")
+  sphingomyelin_metabolism <- c("SGMS1","SGMS2","SMPD1","SMPD2","SMPD3","SMPD4","ENPP7")
+  glycosphingolipid_biosynthesis <- c("UGCG","UGT8","B3GALNT1","B3GALT4","B3GNT5","B4GALNT1","B4GALT5","B4GALT6",
+                                      "ST3GAL2","ST3GAL3","ST3GAL5","ST6GALNAC5","ST6GALNAC6","ST8SIA5","FUT1","FUT2","GALC","GAL3ST1")
+  ceramide_transport_regulation <- c("CERT1","OSBP","VAPA","VAPB","ORMDL1","ORMDL2","ORMDL3")
+  S1P_signaling <- c("SPHK1","SPHK2","SPNS2")
+  lipid_phosphatase_modifiers <- c("PLPP1","PLPP2","PLPP3","PPM1L","PRKD1","PRKD2","PRKD3")
+  sulfurylation_lysosomal_processing <- c("ARSA","ARSB","ARSD","ARSF","ARSG","ARSH","ARSI","ARSJ","ARSK","ARSL","SUMF1","SUMF2","PSAP","CTSA","GM2A","HEXA","HEXB","M6PR")
+  other_genes <- c("A4GALT","ABCC1","ABCG2","ALDH3A2","ALDH3B1","ALDH3B2","CERK","CSNK1G2","CYB5B","FA2H",
+                   "GLB1L","GLB1L2","GLB1L3","MFSD2B","NEU1","NEU2","NEU3","NEU4","SAMD8","STS")
+  sphingo_sets <- list(
+    ceramide_de_novo = ceramide_de_novo,
+    salvage_catabolic_pathway_ceramide = salvage_catabolic_pathway_ceramide,
+    sphingomyelin_metabolism = sphingomyelin_metabolism,
+    glycosphingolipid_biosynthesis = glycosphingolipid_biosynthesis,
+    ceramide_transport_regulation = ceramide_transport_regulation,
+    S1P_signaling = S1P_signaling,
+    lipid_phosphatase_modifiers = lipid_phosphatase_modifiers,
+    sulfurylation_lysosomal_processing = sulfurylation_lysosomal_processing,
+    other_genes = other_genes
+  )
+}
+# Alias fixes
+alias_map <- c("GBA1"="GBA","LASS1"="CERS1","LASS3"="CERS3")
+gs_use <- lapply(sphingo_sets, function(gs){
+  u <- ifelse(gs %in% names(alias_map), alias_map[gs], gs)
+  intersect(u, rownames(logCPM_sym))
+})
+gs_use <- gs_use[vapply(gs_use, length, integer(1)) >= 5]
+stopifnot(length(gs_use) >= 2)
+
+# 5) Compute centered mean-rank scores (genes x samples -> pathways x samples)
+rank_mean_score <- function(M, sets){
+  R <- apply(M, 2, function(v) rank(v, ties.method = "average"))
+  if (!is.matrix(R)) R <- as.matrix(R)
+  G <- nrow(R)
+  R <- (R - 1) / max(1, (G - 1))
+  S <- vapply(sets, function(gs) {
+    ix <- which(rownames(M) %in% gs)
+    if (length(ix) == 0) return(rep(NA_real_, ncol(M)))
+    colMeans(R[ix, , drop = FALSE])
+  }, numeric(ncol(M)))
+  S <- t(S); rownames(S) <- names(sets); colnames(S) <- colnames(M)
+  S - 0.5
+}
+
+rm_mat <- rank_mean_score(logCPM_sym, gs_use)
+stopifnot(is.matrix(rm_mat), nrow(rm_mat) >= 2, ncol(rm_mat) == nrow(meta))
+
+# 6) Ensure column order matches meta
+rm_mat <- rm_mat[, rownames(meta), drop = FALSE]
+meta$sample_id <- rownames(meta)
+stopifnot(identical(colnames(rm_mat), meta$sample_id))
+
+# 7) Persist scores for reuse
+dir.create(here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+out_scores <- here("results","sphingo","rankmean_scores.tsv")
+sc_dt <- as.data.table(rm_mat, keep.rownames = "pathway")
+fwrite(sc_dt, out_scores, sep = "\t")
+cat(sprintf("[rank-mean] %d pathways × %d samples; scores saved to: %s\n",
+            nrow(rm_mat), ncol(rm_mat), out_scores))
+
+# Make rm_mat and meta available
+assign("rm_mat", rm_mat, inherits = TRUE)
+assign("meta", meta, inherits = TRUE)
+
+
+# ---- sphingo_summary_tables_build ----
+suppressPackageStartupMessages({ library(here); library(data.table) })
+
+dir.create(here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+# Preconditions
+stopifnot(exists("rm_mat"), is.matrix(rm_mat))
+stopifnot(exists("meta"), is.data.frame(meta))
+stopifnot(identical(colnames(rm_mat), meta$sample_id))
+
+# Two-group comparer
+.compare_two_groups <- function(mat, pheno, g1, g2) {
+  keep <- which(pheno %in% c(g1, g2))
+  if (length(keep) < 6) stop(sprintf("Too few samples for %s vs %s", g2, g1))
+  X <- mat[, keep, drop = FALSE]
+  grp <- pheno[keep]
+  res <- lapply(seq_len(nrow(X)), function(i) {
+    x2 <- as.numeric(X[i, grp == g2])
+    x1 <- as.numeric(X[i, grp == g1])
+    p  <- if (length(x1) > 2 && length(x2) > 2) wilcox.test(x2, x1)$p.value else NA_real_
+    d  <- median(x2, na.rm = TRUE) - median(x1, na.rm = TRUE)
+    c(p = p, diff = d, n_g2 = sum(grp == g2), n_g1 = sum(grp == g1))
+  })
+  DT <- as.data.table(do.call(rbind, res))
+  DT[, pathway := rownames(X)]
+  setcolorder(DT, c("pathway","p","diff","n_g1","n_g2"))
+  DT[, q := p.adjust(p, method = "BH")]
+  DT[, direction := fifelse(diff > 0, "Up in second", fifelse(diff < 0, "Down in second", "Neutral"))]
+  DT[]
+}
+
+# Phenotypes
+cond <- as.character(meta$condition)
+gg   <- as.character(meta$grade_group)
+group3 <- ifelse(cond == "Normal", "Normal",
+                 ifelse(!is.na(gg) & gg %in% c("LG","HG"), gg, NA))
+
+# Four comparisons
+comparisons <- list(
+  `Tumor_vs_Normal` = list(ph = cond, g1 = "Normal", g2 = "Tumor"),
+  `HG_vs_LG`        = list(ph = gg,   g1 = "LG",     g2 = "HG"),
+  `HG_vs_Normal`    = list(ph = group3, g1 = "Normal", g2 = "HG"),
+  `LG_vs_Normal`    = list(ph = group3, g1 = "Normal", g2 = "LG")
+)
+
+# Compute
+stats_all <- lapply(names(comparisons), function(lbl){
+  spec <- comparisons[[lbl]]
+  DT <- .compare_two_groups(rm_mat, spec$ph, spec$g1, spec$g2)
+  DT[, comparison := lbl]
+  outf <- here("results","sphingo", paste0("rankmean_stats_", lbl, ".tsv"))
+  fwrite(DT, outf, sep = "\t")
+  message("[Summary] Wrote: ", basename(outf))
+  DT
+})
+stats_all <- rbindlist(stats_all, use.names = TRUE, fill = TRUE)
+
+# Direction label
+stats_all[, dir_label := fifelse(diff > 0, "Up", fifelse(diff < 0, "Down", "Neutral"))]
+
+# Count helpers
+count_by_threshold <- function(DT, thr) {
+  sub <- DT[is.finite(q) & q < thr]
+  sub[, .N, by = .(comparison, dir_label)][
+    , dcast(.SD, comparison ~ dir_label, value.var = "N", fill = 0)]
+}
+tab_q005 <- count_by_threshold(stats_all, 0.05)
+tab_q010 <- count_by_threshold(stats_all, 0.10)
+
+add_totals <- function(T){
+  if (!"Up" %in% names(T))  T[, Up := 0L]
+  if (!"Down" %in% names(T))T[, Down := 0L]
+  if (!"Neutral" %in% names(T))T[, Neutral := 0L]
+  T[, `Total sig` := Up + Down + Neutral]
+  T[, `Net (Up-Down)` := Up - Down]
+  T[]
+}
+tab_q005 <- add_totals(tab_q005)
+tab_q010 <- add_totals(tab_q010)
+
+# Write summaries
+out_q005 <- here("results","sphingo","rankmean_summary_counts_q005.tsv")
+out_q010 <- here("results","sphingo","rankmean_summary_counts_q010.tsv")
+fwrite(tab_q005, out_q005, sep = "\t")
+fwrite(tab_q010, out_q010, sep = "\t")
+
+cat("[Summary] Count tables written:\n -", out_q005, "\n -", out_q010, "\n")
+print(tab_q005)
+print(tab_q010)
+
+# Tidy for plotting next
+summary_for_plots <- stats_all[, .(pathway, comparison, q, diff, dir_label)]
+summary_for_plots[, neglog10q := -log10(pmax(q, .Machine$double.xmin))]
+assign("summary_for_plots", summary_for_plots, inherits = TRUE)
+```
+
+```{r sphingo_summary_figures}
+# ---- sphingo_summary_figures ----
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2) })
+dir.create(here("plots","sphingo"), recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(exists("summary_for_plots"))
+
+DT <- copy(summary_for_plots)
+DT[, sig005 := is.finite(q) & q < 0.05]
+DT[, sig010 := is.finite(q) & q < 0.10]
+DT[, dir := factor(dir_label, levels = c("Down","Neutral","Up"))]
+DT[, pathway := factor(pathway, levels = sort(unique(pathway)))]
+
+subtitle_txt <- "Size = -log10(q); color = direction (Up means higher in second group). Stars: q<0.05"
+p_bubble <- ggplot(DT, aes(x = comparison, y = pathway)) +
+  geom_point(aes(size = neglog10q, color = dir), alpha = 0.8) +
+  geom_point(data = DT[sig005 == TRUE], aes(x = comparison, y = pathway),
+             shape = 8, size = 1.5, inherit.aes = FALSE) +
+  scale_size_continuous(name = expression(-log[10](q)), range = c(1.2, 8)) +
+  scale_color_manual(values = c("Down" = "#2166AC", "Neutral" = "grey60", "Up" = "#B2182B"),
+                     name = "Direction") +
+  labs(title = "Sphingolipid subpathways — rank-mean summary across comparisons",
+       subtitle = subtitle_txt,
+       x = "", y = "") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_line(color = "grey90"),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+out_bubble_png <- here("plots","sphingo","rankmean_subpathways_bubble.png")
+out_bubble_pdf <- here("plots","sphingo","rankmean_subpathways_bubble.pdf")
+ggsave(out_bubble_png, p_bubble, width = 10, height = max(5, 0.25*length(levels(DT$pathway)) + 2), dpi = 300)
+ggsave(out_bubble_pdf, p_bubble, width = 10, height = max(5, 0.25*length(levels(DT$pathway)) + 2))
+cat("[Figure] Bubble plot ->\n ", out_bubble_png, "\n ", out_bubble_pdf, "\n")
+
+counts_fun <- function(DT, thr, tag) {
+  sub <- DT[is.finite(q) & q < thr]
+  sub <- sub[dir %in% c("Up","Down")]
+  C <- sub[, .N, by = .(comparison, dir)]
+  C[, thr := tag]
+  C
+}
+C1 <- counts_fun(DT, 0.05, "q<0.05")
+C2 <- counts_fun(DT, 0.10, "q<0.10")
+C  <- rbindlist(list(C1, C2))
+C[, dir := factor(dir, levels = c("Down","Up"))]
+
+p_counts <- ggplot(C, aes(x = comparison, y = N, fill = dir)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ thr) +
+  scale_fill_manual(values = c("Down" = "#2166AC", "Up" = "#B2182B"), name = "Direction") +
+  labs(title = "Significant subpathways by direction",
+       subtitle = "Counts of pathways with FDR q below threshold",
+       x = "", y = "Count of significant pathways") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+out_counts_png <- here("plots","sphingo","rankmean_subpathways_counts.png")
+out_counts_pdf <- here("plots","sphingo","rankmean_subpathways_counts.pdf")
+ggsave(out_counts_png, p_counts, width = 9, height = 4.8, dpi = 300)
+ggsave(out_counts_pdf, p_counts, width = 9, height = 4.8)
+cat("[Figure] Counts bar plot ->\n ", out_counts_png, "\n ", out_counts_pdf, "\n")
+```
+
+UGCG plot
+```{r ugcg_violin_fix_ids_and_plot}
+# ---- ugcg_violin_fix_ids_and_plot ----
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2) })
+
+stopifnot(exists("meta"), exists("logCPM_sym"))
+
+# 1) Pick the best-matching ID column from meta against expression columns
+expr_cols <- colnames(logCPM_sym)
+cand_ids <- intersect(c("sample_id","barcode","sample","sample_submitter_id","colname"),
+                      names(meta))
+stopifnot(length(cand_ids) > 0)
+
+best <- NULL; best_hits <- -1L
+for (nm in cand_ids) {
+  hits <- sum(meta[[nm]] %in% expr_cols, na.rm = TRUE)
+  if (hits > best_hits) { best <- nm; best_hits <- hits }
+}
+if (best_hits <= 0) stop("No metadata ID column matches expression column names.")
+
+id_vec <- as.character(meta[[best]])
+meta_use <- meta[!is.na(id_vec) & id_vec %in% expr_cols, , drop = FALSE]
+meta_use$expr_id <- as.character(meta_use[[best]])
+
+# 2) Define comparisons using the matched IDs
+contrast_samples <- function(label, M){
+  switch(label,
+    "ccrcc_vs_normal_kidney" = {
+      ix <- M$condition %in% c("Normal","Tumor")
+      data.frame(expr_id = M$expr_id[ix],
+                 group   = droplevels(M$condition[ix]),
+                 comparison = "Tumor vs Normal", stringsAsFactors = FALSE)
+    },
+    "hg_vs_lg_ccrcc" = {
+      ix <- M$condition=="Tumor" & !is.na(M$grade_group)
+      data.frame(expr_id = M$expr_id[ix],
+                 group   = droplevels(M$grade_group[ix]),
+                 comparison = "HG vs LG", stringsAsFactors = FALSE)
+    },
+    "hg_ccrcc_vs_normal_kidney" = {
+      ix <- (M$condition=="Normal") | (M$condition=="Tumor" & M$grade_group=="HG")
+      grp <- ifelse(M$condition[ix]=="Normal","Normal","HG")
+      data.frame(expr_id = M$expr_id[ix],
+                 group   = factor(grp, levels=c("Normal","HG")),
+                 comparison = "HG vs Normal", stringsAsFactors = FALSE)
+    },
+    "lg_ccrcc_vs_normal_kidney" = {
+      ix <- (M$condition=="Normal") | (M$condition=="Tumor" & M$grade_group=="LG")
+      grp <- ifelse(M$condition[ix]=="Normal","Normal","LG")
+      data.frame(expr_id = M$expr_id[ix],
+                 group   = factor(grp, levels=c("Normal","LG")),
+                 comparison = "LG vs Normal", stringsAsFactors = FALSE)
+    },
+    stop(sprintf("Unknown contrast: %s", label))
+  )
+}
+
+labels <- c("ccrcc_vs_normal_kidney","hg_vs_lg_ccrcc",
+            "hg_ccrcc_vs_normal_kidney","lg_ccrcc_vs_normal_kidney")
+
+DF <- rbindlist(lapply(labels, function(lb) contrast_samples(lb, meta_use)))
+
+# 3) Keep only samples that truly exist in expression, and report any dropped
+keep <- DF$expr_id %in% expr_cols
+if (!all(keep)) {
+  drop_n <- sum(!keep)
+  message(sprintf("[Align] Dropping %d rows with unmatched IDs (showing up to 5): %s",
+                  drop_n, paste(utils::head(unique(DF$expr_id[!keep]), 5), collapse=", ")))
+}
+DF <- DF[keep, ]
+stopifnot(nrow(DF) > 0)
+
+# 4) Extract UGCG (allow aliases; pick first present)
+ugcg_alias <- c("UGCG","UCGC")
+have <- intersect(ugcg_alias, rownames(logCPM_sym))
+if (!length(have)) stop("UGCG not found in rownames(logCPM_sym).")
+ug <- have[1L]
+
+DF$expr <- as.numeric(logCPM_sym[ug, DF$expr_id])
+
+# 5) Stats per comparison (Wilcoxon + BH)
+stats <- DF[, {
+  lev <- unique(na.omit(group))
+  p <- if (length(lev)==2) {
+    x <- expr[group==lev[1]]; y <- expr[group==lev[2]]
+    if (length(x) > 2 && length(y) > 2) stats::wilcox.test(x,y)$p.value else NA_real_
+  } else NA_real_
+  data.table(
+    n_1 = sum(group==lev[1]), n_2 = sum(group==lev[2]),
+    med_1 = median(expr[group==lev[1]]), med_2 = median(expr[group==lev[2]]),
+    pval = p
+  )
+}, by = comparison]
+stats[, padj := p.adjust(pval, method = "BH")]
+print(stats)
+
+# 6) Faceted violins with BH p in strip label
+lab_dt <- stats[, .(comparison, strip = sprintf("%s (BH p=%s)",
+                                                comparison,
+                                                ifelse(is.na(padj),"NA",
+                                                       formatC(padj, format="e", digits=2))))]
+DF <- merge(DF, lab_dt, by = "comparison", all.x = TRUE)
+
+p <- ggplot(DF, aes(x = group, y = expr)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  labs(title = sprintf("UGCG expression (logCPM) — matched by %s", best),
+       x = "", y = "logCPM") +
+  facet_wrap(~ strip, scales = "free_y") +
+  theme(strip.text = element_text(size = 9))
+
+dir.create(here("plots","sphingo"), recursive = TRUE, showWarnings = FALSE)
+out_png <- here("plots","sphingo","UGCG_violin_by_comparison.png")
+out_pdf <- here("plots","sphingo","UGCG_violin_by_comparison.pdf")
+ggsave(out_png, plot = p, width = 10, height = 7, dpi = 300)
+
+ok <- FALSE
+try({ ggsave(out_pdf, plot = p, width = 10, height = 7, device = cairo_pdf);
+      if (file.exists(out_pdf) && file.info(out_pdf)$size>0) ok <- TRUE }, silent = TRUE)
+if (!ok) try({ pdf(out_pdf, width = 10, height = 7); print(p); dev.off() }, silent = TRUE)
+
+cat("[UGCG] Violin plot written:\n  ", out_png, "\n  ", out_pdf, "\n")
+```
+
+UGCG Violin scores core
+```{r UGCG_violin_core_comparisons}
+# ---- UGCG_violin_core_comparisons ----
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2) })
+
+stopifnot(exists("meta"), exists("logCPM_sym"))
+
+# 1) Pick the best-matching ID column from meta against expression columns
+expr_cols <- colnames(logCPM_sym)
+cand_ids <- intersect(c("sample_id","barcode","sample","sample_submitter_id","colname"),
+                      names(meta))
+stopifnot(length(cand_ids) > 0)
+
+best <- NULL; best_hits <- -1L
+for (nm in cand_ids) {
+  hits <- sum(meta[[nm]] %in% expr_cols, na.rm = TRUE)
+  if (hits > best_hits) { best <- nm; best_hits <- hits }
+}
+if (best_hits <= 0) stop("No metadata ID column matches expression column names.")
+meta_use <- meta[!is.na(meta[[best]]) & meta[[best]] %in% expr_cols, , drop = FALSE]
+meta_use$expr_id <- as.character(meta_use[[best]])
+
+# Ensure phenotype fields exist
+stopifnot(all(c("condition","grade_group") %in% names(meta_use)))
+
+# 2) Define the three comparisons
+mk <- function(ix_ids, grp_vec, comp_name, lvl) {
+  data.frame(
+    expr_id    = meta_use$expr_id[ix_ids],
+    group      = factor(grp_vec[ix_ids], levels = lvl),
+    comparison = comp_name,
+    stringsAsFactors = FALSE
+  )
+}
+# Tumor vs Normal
+ix_A  <- meta_use$condition %in% c("Normal","Tumor")
+DF_A  <- mk(ix_A, meta_use$condition, "Tumor vs Normal", c("Normal","Tumor"))
+# HG vs Normal
+ix_B  <- (meta_use$condition=="Normal") | (meta_use$condition=="Tumor" & meta_use$grade_group=="HG")
+grp_B <- ifelse(meta_use$condition=="Normal", "Normal", "HG")
+DF_B  <- mk(ix_B, grp_B, "HG vs Normal", c("Normal","HG"))
+# LG vs Normal
+ix_C  <- (meta_use$condition=="Normal") | (meta_use$condition=="Tumor" & meta_use$grade_group=="LG")
+grp_C <- ifelse(meta_use$condition=="Normal", "Normal", "LG")
+DF_C  <- mk(ix_C, grp_C, "LG vs Normal", c("Normal","LG"))
+
+DF <- rbindlist(list(DF_A, DF_B, DF_C), use.names = TRUE)
+# Keep only samples that truly exist in expression
+DF <- DF[DF$expr_id %in% expr_cols, ]
+stopifnot(nrow(DF) > 0)
+
+# 3) Pull UGCG expression
+ugcg_alias <- c("UGCG","UCGC")
+ug <- intersect(ugcg_alias, rownames(logCPM_sym))[1]
+if (is.na(ug)) stop("UGCG not found in rownames(logCPM_sym).")
+DF$expr <- as.numeric(logCPM_sym[ug, DF$expr_id])
+
+# 4) Stats per comparison (Wilcoxon, BH)
+stats <- DF[, {
+  lev <- levels(group)
+  if (length(lev)==2) {
+    x <- expr[group==lev[2]]; y <- expr[group==lev[1]]
+    p <- if (length(x) > 2 && length(y) > 2) stats::wilcox.test(x, y)$p.value else NA_real_
+    data.table(n_1=sum(group==lev[1]), n_2=sum(group==lev[2]),
+               med_1=median(y), med_2=median(x), pval=p)
+  } else data.table(n_1=NA_integer_, n_2=NA_integer_, med_1=NA_real_, med_2=NA_real_, pval=NA_real_)
+}, by = comparison]
+stats[, padj := p.adjust(pval, method = "BH")]
+print(stats)
+
+# 5) Plot: Normal blue, tumor(-derived) red
+DF$color_key <- ifelse(DF$group == "Normal", "Normal", "Tumor")
+lab_dt <- stats[, .(comparison,
+                    strip = sprintf("%s (BH p=%s)",
+                                    comparison,
+                                    ifelse(is.na(padj),"NA", formatC(padj, format="e", digits=2))))]
+
+DF <- merge(DF, lab_dt, by = "comparison", all.x = TRUE)
+
+p <- ggplot(DF, aes(x = group, y = expr, fill = color_key)) +
+  geom_violin(trim = FALSE, alpha = 0.6, color = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  scale_fill_manual(values = c(Normal = "blue", Tumor = "red")) +
+  labs(title = sprintf("UGCG expression (logCPM) — matched by %s", best),
+       x = "", y = "logCPM", fill = NULL) +
+  facet_wrap(~ strip, scales = "free_y") +
+  theme(strip.text = element_text(size = 9))
+
+dir.create(here("plots","sphingo"), recursive = TRUE, showWarnings = FALSE)
+out_png <- here("plots","sphingo","UGCG_violin_core_comparisons.png")
+out_pdf <- here("plots","sphingo","UGCG_violin_core_comparisons.pdf")
+ggsave(out_png, plot = p, width = 10, height = 7, dpi = 300)
+ok <- FALSE
+try({ ggsave(out_pdf, plot = p, width = 10, height = 7, device = cairo_pdf);
+      if (file.exists(out_pdf) && file.info(out_pdf)$size>0) ok <- TRUE }, silent = TRUE)
+if (!ok) try({ pdf(out_pdf, width = 10, height = 7); print(p); dev.off() }, silent = TRUE)
+
+cat("[UGCG] Core comparisons written:\n  ", out_png, "\n  ", out_pdf, "\n")
+```
+
+Tumor vs. normal only
+```{r ugcg_effect_size_robust_verify, message=FALSE}
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2) })
+
+# Preconditions
+stopifnot(exists("logCPM_sym"), exists("smeta"))
+stopifnot("condition" %in% names(smeta))
+
+# Build clean sample table
+smeta$sample_id <- rownames(smeta)
+keep <- smeta$condition %in% c("Normal","Tumor")
+S <- smeta[keep, c("sample_id","condition")]
+S$condition <- factor(S$condition, levels = c("Normal","Tumor"))
+
+# Resolve UGCG (allow alias)
+ugcg_alias <- c("UGCG","UCGC")
+ug <- intersect(ugcg_alias, rownames(logCPM_sym))[1]
+stopifnot(length(ug) == 1)
+
+# Align expression
+X <- logCPM_sym[ug, S$sample_id, drop = FALSE]
+DF <- data.frame(
+  sample_id = S$sample_id,
+  group     = S$condition,            # factor: Normal, Tumor
+  expr      = as.numeric(X[1, ])
+)
+
+# Stats
+x <- DF$expr[DF$group == "Tumor"]     # Tumor
+y <- DF$expr[DF$group == "Normal"]    # Normal
+n1 <- length(x); n2 <- length(y)
+
+wt <- stats::wilcox.test(x, y, alternative = "two.sided", exact = FALSE)
+
+# Rank-biserial via U (Tumor-first)
+ranks  <- rank(c(x, y))
+R1     <- sum(ranks[seq_len(n1)])               # rank sum for Tumor
+U1     <- R1 - n1*(n1 + 1)/2
+A_tum  <- U1 / (n1 * n2)                        # Vargha–Delaney A (Tumor vs Normal)
+r_U    <- 2*A_tum - 1                           # >0 means Tumor > Normal
+
+# Pairwise sign version (Cliff’s delta)
+Dmat   <- outer(x, y, "-")
+r_pair <- (sum(Dmat > 0) - sum(Dmat < 0)) / (n1 * n2)
+
+# Sanity table
+stats_tbl <- data.table(
+  gene       = ug,
+  n_Normal   = n2,
+  n_Tumor    = n1,
+  med_Normal = median(y),
+  med_Tumor  = median(x),
+  diff_med   = median(x) - median(y),
+  W_stat     = as.numeric(wt$statistic),
+  U_tumor    = U1,
+  A_tumor    = A_tum,
+  p_value    = wt$p.value,
+  r_from_U   = r_U,
+  r_pairwise = r_pair
+)
+print(stats_tbl)
+
+# Save stats
+out_stats <- here("results","sphingo", paste0(ug, "_tumor_vs_normal_stats.tsv"))
+dir.create(dirname(out_stats), recursive = TRUE, showWarnings = FALSE)
+fwrite(stats_tbl, out_stats, sep = "\t")
+
+# Plot (Tumor=red, Normal=blue)
+p <- ggplot(DF, aes(x = group, y = expr, fill = group)) +
+  geom_violin(trim = FALSE, alpha = 0.6, color = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  scale_fill_manual(values = c(Normal = "blue", Tumor = "red")) +
+  labs(
+    title = sprintf("%s expression (logCPM) — Tumor vs Normal  [p=%.2e, r=%.3f]",
+                    ug, wt$p.value, r_U),
+    x = "", y = "logCPM", fill = NULL
+  )
+
+out_png <- here("plots","sphingo", paste0(ug, "_violin_Tumor_vs_Normal.png"))
+out_pdf <- here("plots","sphingo", paste0(ug, "_violin_Tumor_vs_Normal.pdf"))
+dir.create(dirname(out_png), recursive = TRUE, showWarnings = FALSE)
+ggsave(out_png, plot = p, width = 6.5, height = 5, dpi = 300)
+ok <- FALSE
+try({ ggsave(out_pdf, plot = p, width = 6.5, height = 5, device = cairo_pdf);
+      if (file.exists(out_pdf) && file.info(out_pdf)$size > 0) ok <- TRUE }, silent = TRUE)
+if (!ok) try({ pdf(out_pdf, width = 6.5, height = 5); print(p); dev.off() }, silent = TRUE)
+
+cat("[UGCG VERIFY] Wrote:\n - ", out_stats, "\n - ", out_png, "\n - ", out_pdf, "\n", sep = "")
+
+```
+
+GSEA tumor vs. normal, glycosphingolipid biosynthesis
+```{r glyco_sig_violin_TvN, message=FALSE}
+# ---- glyco_sig_violin_TvN ----
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2) })
+
+# Preconditions
+stopifnot(exists("logCPM_sym"), exists("smeta"))
+stopifnot("condition" %in% names(smeta))
+
+# Curated gene set (with alias rescue – consistent with earlier chunks)
+glycosphingolipid_biosynthesis <- c(
+  "UGCG","UGT8","B3GALNT1","B3GALT4","B3GNT5","B4GALNT1","B4GALT5","B4GALT6",
+  "ST3GAL2","ST3GAL3","ST3GAL5","ST6GALNAC5","ST6GALNAC6","ST8SIA5","FUT1","FUT2",
+  "GALC","GAL3ST1"
+)
+alias_map <- c("GBA1"="GBA","LASS1"="CERS1","LASS3"="CERS3") # harmless here
+gs <- ifelse(glycosphingolipid_biosynthesis %in% names(alias_map),
+             alias_map[glycosphingolipid_biosynthesis],
+             glycosphingolipid_biosynthesis)
+
+genes_in <- intersect(gs, rownames(logCPM_sym))
+stopifnot(length(genes_in) >= 5)
+
+# Build sample table (Normal/Tumor only)
+smeta$sample_id <- rownames(smeta)
+keep <- smeta$condition %in% c("Normal","Tumor")
+S <- smeta[keep, c("sample_id","condition")]
+S$condition <- factor(S$condition, levels = c("Normal","Tumor"))
+
+# Subset expression to these samples and genes
+X <- logCPM_sym[genes_in, S$sample_id, drop = FALSE]
+
+# Centered mean-rank score in [-0.5, 0.5]
+rank_centered <- function(mat) {
+  R <- apply(mat, 2, function(v) rank(v, ties.method = "average"))
+  if (is.vector(R)) R <- matrix(R, nrow = nrow(mat), dimnames = list(rownames(mat), colnames(mat)))
+  R <- R / nrow(mat)
+  colMeans(R, na.rm = TRUE) - 0.5
+}
+set.seed(1234)
+score <- rank_centered(X)
+
+# Assemble dataframe
+DF <- data.frame(
+  sample_id = names(score),
+  group     = S$condition[match(names(score), S$sample_id)],
+  score     = as.numeric(score),
+  row.names = names(score)
+)
+
+# Stats: Wilcoxon + rank-biserial r (Tumor > Normal -> r > 0)
+x <- DF$score[DF$group == "Tumor"]
+y <- DF$score[DF$group == "Normal"]
+n1 <- length(x); n2 <- length(y)
+wt <- wilcox.test(x, y, alternative = "two.sided", exact = FALSE)
+
+ranks  <- rank(c(x, y))
+R1     <- sum(ranks[seq_len(n1)])
+U1     <- R1 - n1*(n1 + 1)/2
+A_tum  <- U1 / (n1 * n2)
+r_U    <- 2*A_tum - 1
+
+# Print/save stats
+stats_tbl <- data.table(
+  pathway    = "Glycosphingolipid biosynthesis (rank-mean)",
+  genes_used = length(genes_in),
+  n_Normal   = n2,
+  n_Tumor    = n1,
+  med_Normal = median(y),
+  med_Tumor  = median(x),
+  diff_med   = median(x) - median(y),
+  p_value    = wt$p.value,
+  r_biserial = r_U
+)
+print(stats_tbl)
+
+dir.create(here("results","sphingo"), recursive = TRUE, showWarnings = FALSE)
+fwrite(stats_tbl, here("results","sphingo","glyco_signature_Tumor_vs_Normal_stats.tsv"), sep = "\t")
+
+# Violin plot (Tumor=red, Normal=blue)
+p <- ggplot(DF, aes(x = group, y = score, fill = group)) +
+  geom_violin(trim = FALSE, alpha = 0.6, color = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  scale_fill_manual(values = c(Normal = "blue", Tumor = "red")) +
+  labs(
+    title = sprintf("Glycosphingolipid biosynthesis signature — Tumor vs Normal  [p=%.2e, r=%.3f]",
+                    wt$p.value, r_U),
+    x = "", y = "Centered mean-rank score (−0.5…0.5)", fill = NULL
+  )
+
+dir.create(here("plots","sphingo"), recursive = TRUE, showWarnings = FALSE)
+out_png <- here("plots","sphingo","glyco_signature_violin_Tumor_vs_Normal.png")
+out_pdf <- here("plots","sphingo","glyco_signature_violin_Tumor_vs_Normal.pdf")
+ggsave(out_png, plot = p, width = 6.5, height = 5, dpi = 300)
+ok <- FALSE
+try({ ggsave(out_pdf, plot = p, width = 6.5, height = 5, device = cairo_pdf);
+      if (file.exists(out_pdf) && file.info(out_pdf)$size > 0) ok <- TRUE }, silent = TRUE)
+if (!ok) try({ pdf(out_pdf, width = 6.5, height = 5); print(p); dev.off() }, silent = TRUE)
+
+cat("[Glyco signature] Wrote:\n - ", out_png, "\n - ", out_pdf,
+    "\n - ", here("results","sphingo","glyco_signature_Tumor_vs_Normal_stats.tsv"), "\n", sep = "")
+```
+
+Correlations with HIF
+```{r minimal_hif_rankmean_pipeline}
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2); library(pheatmap) })
+
+# Output dirs
+dir.create(here("results","hif_min"),  recursive = TRUE, showWarnings = FALSE)
+dir.create(here("plots","hif_min"),    recursive = TRUE, showWarnings = FALSE)
+
+# Preconditions
+stopifnot(exists("logCPM_sym"), is.matrix(logCPM_sym))
+stopifnot(exists("smeta"), is.data.frame(smeta))
+stopifnot("condition" %in% names(smeta))
+stopifnot(ncol(logCPM_sym) == nrow(smeta))
+rownames(smeta) <- colnames(logCPM_sym)
+
+```
+
+```{r hif_alias_and_sets}
+# --- 1) Aliases + minimal gene sets (lean, canonical) ---
+alias_map <- c("GBA1"="GBA","LASS1"="CERS1","LASS3"="CERS3")  # keep consistent with earlier chunks
+
+# Hypoxia/HIF1-lean: glycolysis/oxidative stress core
+hallmark_hypoxia_core <- c(
+  "CA9","SLC2A1","VEGFA","BNIP3","ENO1","LDHA","PGK1","ALDOA","PFKP",
+  "HK2","PGAM1","BHLHE40","NDRG1","P4HA1","EGLN3"
+)
+
+# HIF1A-lean targets
+hif1a_targets_min <- c("CA9","SLC2A1","PFKP","PGK1","ALDOA","LDHA","HK2","BNIP3","BHLHE40","EGLN3")
+
+# EPAS1(HIF2A)-lean targets (ccRCC-relevant)
+epas1_targets_min <- c("EPO","VEGFA","ANGPT2","PLIN2","CCND1","SLC7A5","SLC1A5","NDRG1","KDM3A","P4HA1")
+
+# Glycosphingolipid biosynthesis (kept for downstream joins/plots)
+glyco_biosynthesis <- c(
+  "UGCG","UGT8","B3GALNT1","B3GALT4","B3GNT5","B4GALNT1","B4GALT5","B4GALT6",
+  "ST3GAL2","ST3GAL3","ST3GAL5","ST6GALNAC5","ST6GALNAC6","ST8SIA5","FUT1","FUT2","GALC","GAL3ST1"
+)
+
+# Alias rescue
+fix_alias <- function(x) ifelse(x %in% names(alias_map), alias_map[x], x)
+hallmark_hypoxia_core <- fix_alias(hallmark_hypoxia_core)
+hif1a_targets_min     <- fix_alias(hif1a_targets_min)
+epas1_targets_min     <- fix_alias(epas1_targets_min)
+glyco_biosynthesis    <- fix_alias(glyco_biosynthesis)
+
+# Keep genes present in expression
+present <- function(gs) intersect(gs, rownames(logCPM_sym))
+sets_raw <- list(
+  hallmark_hypoxia_core = hallmark_hypoxia_core,
+  hif1a_targets_min     = hif1a_targets_min,
+  epas1_targets_min     = epas1_targets_min
+)
+sets_use <- lapply(sets_raw, present)
+sets_use <- sets_use[vapply(sets_use, length, integer(1)) >= 5]
+stopifnot(length(sets_use) >= 1)
+
+cat("[HIF sets] Using:", paste(names(sets_use), collapse = ", "),
+    " | sizes:", paste(vapply(sets_use, length, integer(1)), collapse = ", "), "\n")
+
+```
+
+```{r hif_rankmean_score}
+# --- 2) Rank-mean scorer (same logic as earlier) ---
+suppressPackageStartupMessages({ library(data.table); library(here) })
+
+rankmean_score <- function(M, sets){
+  R <- apply(M, 2, function(v) rank(v, ties.method = "average"))
+  if (!is.matrix(R)) R <- as.matrix(R)
+  G <- nrow(R)
+  R <- (R - 1) / max(1, (G - 1))  # normalize to [0,1]
+  S <- vapply(sets, function(gs){
+    ix <- which(rownames(M) %in% gs)
+    if (length(ix) == 0) return(rep(NA_real_, ncol(M)))
+    colMeans(R[ix, , drop = FALSE])
+  }, numeric(ncol(M)))
+  S <- t(S); rownames(S) <- names(sets); colnames(S) <- colnames(M)
+  S - 0.5  # center around 0
+}
+
+stopifnot(exists("sets_use"), length(sets_use) >= 1)
+HIF_scores <- rankmean_score(logCPM_sym, sets_use)
+
+dir.create(here("results","hif_min"), recursive = TRUE, showWarnings = FALSE)
+fwrite(as.data.table(HIF_scores, keep.rownames = "score_name"),
+       here("results","hif_min","hif_rankmean_scores.tsv"), sep = "\t")
+
+cat("[HIF] Rank-mean scores:", nrow(HIF_scores), "scores ×", ncol(HIF_scores), "samples\n")
+```
+
+```{r hif_build_tumor_only_table}
+# --- 3) Build tumor-only analysis frame ---
+tum_idx <- smeta$condition == "Tumor"
+stopifnot(any(tum_idx))
+samples_tumor <- rownames(smeta)[tum_idx]
+
+# UGCG expression
+ugcg_alias <- c("UGCG","UCGC")
+ugcg_row <- intersect(ugcg_alias, rownames(logCPM_sym))[1]
+stopifnot(length(ugcg_row) == 1)
+
+# Glyco signature score (rank-mean on glyco_biosynthesis)
+glyco_in <- intersect(glyco_biosynthesis, rownames(logCPM_sym))
+stopifnot(length(glyco_in) >= 5)
+glyco_score <- {
+  R <- apply(logCPM_sym, 2, function(v) rank(v, ties.method = "average"))
+  if (!is.matrix(R)) R <- as.matrix(R)
+  G <- nrow(R); R <- (R - 1) / max(1, (G - 1))
+  colMeans(R[rownames(logCPM_sym) %in% glyco_in, , drop = FALSE]) - 0.5
+}
+
+# HIF mRNA
+epas1_mrna <- if ("EPAS1" %in% rownames(logCPM_sym)) logCPM_sym["EPAS1", ] else rep(NA_real_, ncol(logCPM_sym))
+hif1a_mrna <- if ("HIF1A" %in% rownames(logCPM_sym)) logCPM_sym["HIF1A", ] else rep(NA_real_, ncol(logCPM_sym))
+
+# HIF2 − HIF1 balance (prefer set scores; fallback to mRNA)
+h2 <- if ("epas1_targets_min" %in% rownames(HIF_scores)) HIF_scores["epas1_targets_min", ] else epas1_mrna
+h1 <- if ("hif1a_targets_min" %in% rownames(HIF_scores)) HIF_scores["hif1a_targets_min", ] else hif1a_mrna
+hif2_minus_hif1 <- h2 - h1
+
+# Assemble tumor-only table
+DT <- data.table(
+  sample_id       = samples_tumor,
+  grade_group     = if ("grade_group" %in% names(smeta)) smeta$grade_group[tum_idx] else factor(NA),
+  UGCG_expr       = as.numeric(logCPM_sym[ugcg_row, samples_tumor]),
+  glyco_score     = as.numeric(glyco_score[samples_tumor]),
+  hypoxia_core    = if ("hallmark_hypoxia_core" %in% rownames(HIF_scores)) as.numeric(HIF_scores["hallmark_hypoxia_core", samples_tumor]) else NA_real_,
+  HIF1_set        = if ("hif1a_targets_min" %in% rownames(HIF_scores))      as.numeric(HIF_scores["hif1a_targets_min", samples_tumor]) else NA_real_,
+  EPAS1_set       = if ("epas1_targets_min" %in% rownames(HIF_scores))      as.numeric(HIF_scores["epas1_targets_min", samples_tumor]) else NA_real_,
+  EPAS1_mRNA      = as.numeric(epas1_mrna[samples_tumor]),
+  HIF1A_mRNA      = as.numeric(hif1a_mrna[samples_tumor]),
+  HIF2_minus_HIF1 = as.numeric(hif2_minus_hif1[samples_tumor])
+)
+
+# Persist
+dir.create(here("results","hif_min"), recursive = TRUE, showWarnings = FALSE)
+fwrite(DT, here("results","hif_min","tumor_only_table.tsv"), sep = "\t")
+cat("[HIF-min] Wrote tumor-only table: results/hif_min/tumor_only_table.tsv\n")
+
+```
+
+```{r hif_spearman_correlations, message=FALSE}
+suppressPackageStartupMessages({ library(here); library(data.table) })
+
+# Preconditions
+stopifnot(exists("DT"), is.data.table(DT))
+
+endpoints  <- c("UGCG_expr","glyco_score")
+predictors <- c("hypoxia_core","HIF1_set","EPAS1_set","EPAS1_MRNA","HIF1A_MRNA","HIF2_minus_HIF1")
+# Be tolerant to column name case
+names(DT) <- sub("^epas1_mrna$", "EPAS1_MRNA", names(DT), ignore.case = TRUE)
+names(DT) <- sub("^hif1a_mrna$", "HIF1A_MRNA", names(DT), ignore.case = TRUE)
+
+pairs <- CJ(endpoint = endpoints, predictor = predictors)
+
+.cor1 <- function(x, y){
+  ok <- is.finite(x) & is.finite(y)
+  n  <- sum(ok)
+  if (n >= 10) {
+    ct <- suppressWarnings(suppressMessages(cor.test(x[ok], y[ok], method = "spearman")))
+    list(n = n, rho = unname(ct$estimate), p = ct$p.value)
+  } else {
+    list(n = n, rho = NA_real_, p = NA_real_)
+  }
+}
+
+COR <- pairs[, as.data.table(.cor1(DT[[endpoint]], DT[[predictor]])), by = .(endpoint, predictor)]
+COR[, q := p.adjust(p, method = "BH")]
+
+dir.create(here("results","hif_min"), recursive = TRUE, showWarnings = FALSE)
+fwrite(COR, here("results","hif_min","spearman_correlations.tsv"), sep = "\t")
+
+print(COR[order(endpoint, q)])
+```
+
+```{r hif_scatter_plots, message=FALSE}
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2) })
+dir.create(here("plots","hif_min"), recursive = TRUE, showWarnings = FALSE)
+
+# Preconditions
+stopifnot(exists("DT"), is.data.table(DT))
+stopifnot(exists("COR"), is.data.table(COR))
+stopifnot(exists("endpoints"), exists("predictors"))
+
+# Label with rho and BH-q pulled from COR
+annot_lab <- function(ep, pr){
+  r <- COR[endpoint == ep & predictor == pr][1]
+  if (nrow(r) == 0L) return(sprintf("%s vs %s\nrho=NA, q=NA", ep, pr))
+  sprintf("%s vs %s\nrho=%.2f, q=%s",
+          ep, pr,
+          ifelse(is.finite(r$rho), r$rho, NaN),
+          ifelse(is.finite(r$q), formatC(r$q, format = "e", digits = 2), "NA"))
+}
+
+# Plot one pair (skip if <10 complete cases)
+plot_scatter <- function(ep, pr){
+  d <- DT[, .(x = get(pr), y = get(ep))]
+  ok <- is.finite(d$x) & is.finite(d$y)
+  if (sum(ok) < 10) return(NULL)
+  ggplot(d[ok], aes(x = x, y = y)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "loess", se = TRUE) +
+    labs(title = annot_lab(ep, pr), x = pr, y = ep)
+}
+
+# Iterate all endpoint×predictor pairs
+for (ep in endpoints) for (pr in predictors) {
+  p <- plot_scatter(ep, pr)
+  if (is.null(p)) next
+  pngf <- here("plots","hif_min", sprintf("scatter_%s_vs_%s.png", ep, pr))
+  pdff <- here("plots","hif_min", sprintf("scatter_%s_vs_%s.pdf",  ep, pr))
+  ggsave(pngf, p, width = 6.5, height = 5, dpi = 300)
+  ok <- FALSE
+  try({ ggsave(pdff, p, width = 6.5, height = 5, device = cairo_pdf); if (file.exists(pdff) && file.info(pdff)$size>0) ok <- TRUE }, silent = TRUE)
+  if (!ok) try({ pdf(pdff, width = 6.5, height = 5); print(p); dev.off() }, silent = TRUE)
+}
+cat("[HIF-min] Scatter plots written to plots/hif_min/\n")
+```
+
+```{r hif_grade_adjusted_linear_models, message=FALSE}
+# --- 6) Grade-adjusted linear models (tumor-only) ---
+suppressPackageStartupMessages({ library(here); library(data.table); library(ggplot2) })
+
+# Preconditions
+stopifnot(exists("DT"), is.data.table(DT))
+req <- c("UGCG_expr","glyco_score","HIF2_minus_HIF1","hypoxia_core","grade_group")
+stopifnot(all(req %in% names(DT)))
+
+run_lm <- function(formula_str){
+  d <- copy(DT)
+  d <- d[is.finite(UGCG_expr) & is.finite(glyco_score)]
+  d$grade_group <- droplevels(d$grade_group)
+  if (!("HG" %in% levels(d$grade_group) && "LG" %in% levels(d$grade_group))) d$grade_group <- NA
+  d <- d[complete.cases(d[, all.vars(as.formula(formula_str)), with = FALSE])]
+  if (nrow(d) < 30) return(NULL)
+  fit <- lm(as.formula(formula_str), data = d)
+  cc  <- summary(fit)$coefficients
+  CI  <- suppressWarnings(confint(fit))
+  TAB <- data.table(term = rownames(cc), estimate = cc[,1], se = cc[,2], t = cc[,3], p = cc[,4])
+  TAB[, c("conf.low","conf.high") := .(CI[term,1], CI[term,2])]
+  TAB[, model := formula_str]
+  TAB
+}
+
+LM1 <- run_lm("UGCG_expr ~ HIF2_minus_HIF1 + hypoxia_core + grade_group")
+LM2 <- run_lm("glyco_score ~ HIF2_minus_HIF1 + hypoxia_core + grade_group")
+LM  <- rbindlist(list(LM1, LM2), fill = TRUE)
+
+if (!is.null(LM) && nrow(LM)) {
+  LM[, q := p.adjust(p, method = "BH"), by = model]
+  dir.create(here("results","hif_min"), recursive = TRUE, showWarnings = FALSE)
+  fwrite(LM, here("results","hif_min","linear_models.tsv"), sep = "\t")
+
+  # Coef plots (exclude intercept)
+  plot_coef <- function(model_lbl){
+    T <- LM[model == model_lbl & term != "(Intercept)"]
+    if (!nrow(T)) return(NULL)
+    T[, term := factor(term, levels = rev(T$term))]
+    ggplot(T, aes(x = term, y = estimate)) +
+      geom_hline(yintercept = 0, linewidth = 0.3) +
+      geom_point() +
+      geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.15) +
+      coord_flip() +
+      labs(title = paste0("Coefficients: ", model_lbl), x = "", y = "Estimate (95% CI)")
+  }
+
+  dir.create(here("plots","hif_min"), recursive = TRUE, showWarnings = FALSE)
+  for (m in unique(LM$model)) {
+    p <- plot_coef(m); if (is.null(p)) next
+    pngf <- here("plots","hif_min", sprintf("coefplot_%s.png", gsub("[ ~+*:]","_", m)))
+    pdff <- here("plots","hif_min", sprintf("coefplot_%s.pdf",  gsub("[ ~+*:]","_", m)))
+    ggsave(pngf, p, width = 6.8, height = 4.8, dpi = 300)
+    ok <- FALSE
+    try({ ggsave(pdff, p, width = 6.8, height = 4.8, device = cairo_pdf); if (file.exists(pdff) && file.info(pdff)$size>0) ok <- TRUE }, silent = TRUE)
+    if (!ok) try({ pdf(pdff, width = 6.8, height = 4.8); print(p); dev.off() }, silent = TRUE)
+  }
+  cat("[HIF-min] Wrote linear models and coefficient plots.\n")
+} else {
+  cat("[HIF-min] Skipped LM: insufficient complete cases (<30 rows).\n")
+}
+
+```
+
+```{r hif_joint_heatmap, message=FALSE}
+# --- 7) Joint heatmap (lightweight) ---
+suppressPackageStartupMessages({ library(here); library(data.table); library(pheatmap) })
+
+stopifnot(exists("DT"), is.data.table(DT))
+
+mat_rows <- list(
+  HIF2_minus_HIF1 = DT$HIF2_minus_HIF1,
+  hypoxia_core    = DT$hypoxia_core,
+  HIF1_set        = DT$HIF1_set,
+  EPAS1_set       = DT$EPAS1_set,
+  glyco_score     = DT$glyco_score,
+  UGCG_expr       = DT$UGCG_expr
+)
+M <- do.call(rbind, lapply(mat_rows, function(v) as.numeric(scale(v))))
+rownames(M) <- names(mat_rows)
+colnames(M) <- DT$sample_id
+
+ord <- order(M["HIF2_minus_HIF1", ], decreasing = TRUE, na.last = NA)
+M <- M[, ord, drop = FALSE]
+
+ann_col <- data.frame(grade_group = DT$grade_group[ord])
+rownames(ann_col) <- colnames(M)
+
+dir.create(here("plots","hif_min"), recursive = TRUE, showWarnings = FALSE)
+pngf <- here("plots","hif_min","heatmap_hif_glyco.png")
+pdff <- here("plots","hif_min","heatmap_hif_glyco.pdf")
+
+pheatmap(M, annotation_col = ann_col, filename = pngf, width = 9, height = 4.8)
+pheatmap(M, annotation_col = ann_col, filename = pdff, width = 9, height = 4.8)
+
+cat("[HIF-min] Heatmap written:\n - ", pngf, "\n - ", pdff, "\n", sep = "")
+
+```
+
+

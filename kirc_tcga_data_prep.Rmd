@@ -1,0 +1,1184 @@
+---
+---
+title: "KIRC TCGA data prep"
+author: "Alejandro Sanchez"
+date: "2025-11-04"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    df_print: default
+---
+
+Project setup
+```{r setup, include=FALSE}
+# ---- setup_knit_safe ----
+# Deterministic + quiet by default
+set.seed(1234)
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 7, fig.height = 5)
+
+# Prefer Bioconductor repos when available (no install here)
+if (requireNamespace("BiocManager", quietly = TRUE)) {
+  options(repos = BiocManager::repositories())
+} else {
+  options(repos = c(CRAN = "https://cloud.r-project.org"))
+}
+
+# here(): pin root to this Rmd if resolvable; avoid hardcoding paths
+if (!requireNamespace("here", quietly = TRUE)) {
+  stop("Package 'here' not installed. Install it before knitting: install.packages('here')", call. = FALSE)
+}
+rmd_path <- tryCatch(knitr::current_input(), error = function(e) NULL)
+if (!is.null(rmd_path) && file.exists(rmd_path)) {
+  try(here::i_am(rmd_path), silent = TRUE)
+}
+
+# Required packages (no installation during knit)
+cran_pkgs <- c("data.table","ggplot2","matrixStats","msigdbr","sessioninfo")
+bioc_pkgs <- c("TCGAbiolinks","SummarizedExperiment","fgsea","edgeR","limma","sva")
+
+req <- c(cran_pkgs, bioc_pkgs)
+missing <- req[!vapply(req, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) {
+  stop(
+    paste0(
+      "Missing packages: ", paste(missing, collapse = ", "),
+      "\nInstall *outside* of knitting:\n",
+      "install.packages(c(", 
+      paste(sprintf('\"%s\"', intersect(missing, cran_pkgs)), collapse = ", "),
+      "))\n",
+      "BiocManager::install(c(", 
+      paste(sprintf('\"%s\"', intersect(missing, bioc_pkgs)), collapse = ", "),
+      "), ask = FALSE, update = FALSE)"
+    ),
+    call. = FALSE
+  )
+}
+
+# Load quietly
+suppressPackageStartupMessages({
+  lapply(req, function(p) library(p, character.only = TRUE))
+})
+
+# EnhancedVolcano is optional; don’t install here
+has_EnhancedVolcano <- requireNamespace("EnhancedVolcano", quietly = TRUE)
+
+# Minimal console echo for diagnostics
+cat("[setup] Root:", here::here(), 
+    "| R:", as.character(getRversion()),
+    "| Bioc:", tryCatch(as.character(BiocManager::version()), error = function(e) NA),
+    "| EnhancedVolcano:", has_EnhancedVolcano, "\n")
+```
+
+Project directories
+```{r dirs, echo=TRUE}
+# ---- create_project_dirs ----
+dirs <- c("data","results","outputs","plots","logs")
+paths <- here::here(dirs)
+
+# Create if missing; verify existence & writability
+ok_create <- vapply(paths, function(p) {
+  if (!dir.exists(p)) dir.create(p, recursive = TRUE, showWarnings = FALSE)
+  dir.exists(p)
+}, logical(1))
+
+if (!all(ok_create)) {
+  bad <- paste(paths[!ok_create], collapse = ", ")
+  stop("Failed to create required directories: ", bad, call. = FALSE)
+}
+
+# Writability probe (touch-and-remove temp file)
+ok_write <- vapply(paths, function(p) {
+  tf <- file.path(p, ".write_test_.tmp")
+  ok <- tryCatch({ writeLines("ok", tf); TRUE }, error = function(e) FALSE)
+  if (ok) unlink(tf, force = TRUE)
+  ok
+}, logical(1))
+
+if (!all(ok_write)) {
+  bad <- paste(paths[!ok_write], collapse = ", ")
+  stop("Directories not writable: ", bad, call. = FALSE)
+}
+
+cat("[dirs] root:", here::here(), "\n")
+print(data.frame(dir = dirs, path = normalizePath(paths, winslash = "/", mustWork = FALSE),
+                 exists = ok_create, writable = ok_write, row.names = NULL))
+```
+Reproducibility 
+```{r reproducibility, echo=TRUE}
+# ---- reproducibility_log ----
+set.seed(1234)  # idempotent
+if (requireNamespace("BiocManager", quietly = TRUE)) {
+  options(repos = BiocManager::repositories())
+}
+
+# Prepare log path
+log_dir  <- here::here("logs")
+if (!dir.exists(log_dir)) dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+log_path <- here::here("logs", sprintf("sessioninfo_%s.txt", format(Sys.Date(), "%Y%m%d")))
+
+# Build report (avoid sink)
+lines <- c(
+  "Reproducibility report",
+  "======================",
+  sprintf("Project root: %s", here::here()),
+  sprintf("R version:    %s", as.character(getRversion())),
+  sprintf("Platform:     %s", paste(R.version$platform, R.version$arch, R.version$os)),
+  sprintf("Bioc version: %s", tryCatch(as.character(BiocManager::version()), error = function(e) NA)),
+  sprintf("Seed:         %s", 1234),
+  ""
+)
+
+# Session details via sessioninfo if available
+sess_txt <- tryCatch(
+  {
+    if (requireNamespace("sessioninfo", quietly = TRUE)) {
+      capture.output(sessioninfo::session_info())
+    } else {
+      capture.output(sessionInfo())
+    }
+  },
+  error = function(e) sprintf("Failed to capture session info: %s", e$message)
+)
+
+writeLines(c(lines, sess_txt), con = log_path, sep = "\n")
+
+cat("[reproducibility] Wrote session log:", normalizePath(log_path, winslash = "/"), "\n")
+```
+
+TCGA Download/Cache
+```{r tcga_download_cache, echo=TRUE}
+# ---- tcga_kirc_download_cache ----
+suppressPackageStartupMessages({
+  library(here); library(TCGAbiolinks); library(SummarizedExperiment)
+})
+
+# Paths
+cache_dir <- here::here("data", "TCGA_KIRC")
+raw_rds   <- here::here("data", "tcga_kirc_se_raw.rds")
+if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Helper: concise stop on error
+.fail <- function(...) stop(sprintf(...), call. = FALSE)
+
+# Load or fetch
+if (file.exists(raw_rds)) {
+  message("[TCGA] Using cached RDS: ", raw_rds)
+  se_raw <- tryCatch(readRDS(raw_rds), error = function(e) .fail("Failed to read cached RDS: %s", e$message))
+} else {
+  message("[TCGA] Querying GDC: TCGA-KIRC / STAR - Counts")
+  q <- tryCatch(
+    GDCquery(
+      project       = "TCGA-KIRC",
+      data.category = "Transcriptome Profiling",
+      data.type     = "Gene Expression Quantification",
+      workflow.type = "STAR - Counts"
+    ),
+    error = function(e) .fail("GDCquery failed: %s", e$message)
+  )
+
+  message("[TCGA] Downloading to: ", cache_dir)
+  ok_dl <- tryCatch({ GDCdownload(q, directory = cache_dir); TRUE },
+                    error = function(e) .fail("GDCdownload failed: %s", e$message))
+  if (!ok_dl) .fail("Unknown failure during GDCdownload.")
+
+  message("[TCGA] Preparing SummarizedExperiment …")
+  se_raw <- tryCatch(GDCprepare(q, directory = cache_dir),
+                     error = function(e) .fail("GDCprepare failed: %s", e$message))
+
+  if (!inherits(se_raw, "SummarizedExperiment")) .fail("Object returned is not a SummarizedExperiment.")
+  saveRDS(se_raw, raw_rds)
+  message("[TCGA] Saved: ", raw_rds)
+}
+
+# Sanity checks
+stopifnot(inherits(se_raw, "SummarizedExperiment"))
+assays_avail <- SummarizedExperiment::assayNames(se_raw)
+cat("[TCGA] Assays:", paste(assays_avail, collapse = ", "), "\n")
+
+meta_raw <- as.data.frame(SummarizedExperiment::colData(se_raw))
+if (!"sample_type" %in% names(meta_raw)) .fail("Missing 'sample_type' in colData.")
+
+tab_types <- sort(table(meta_raw$sample_type), decreasing = TRUE)
+cat("[TCGA] Sample types (top):\n"); print(utils::head(tab_types, 10))
+
+has_tumor  <- any(meta_raw$sample_type == "Primary Tumor")
+has_normal <- any(meta_raw$sample_type == "Solid Tissue Normal")
+cat("[TCGA] Has Tumor:", has_tumor, " Has Normal:", has_normal, "\n")
+if (!(has_tumor && has_normal)) .fail("Expected Tumor and Normal samples not both present.")
+```
+TCGA Subset and QC
+```{r subset_qc, echo=TRUE}
+# ---- subset_qc ----
+suppressPackageStartupMessages({
+  library(here); library(SummarizedExperiment); library(data.table)
+})
+
+raw_rds <- here::here("data", "tcga_kirc_se_raw.rds")
+if (!file.exists(raw_rds)) stop("Missing raw RDS: ", raw_rds, call. = FALSE)
+se_raw <- readRDS(raw_rds)
+stopifnot(inherits(se_raw, "SummarizedExperiment"))
+
+# Select a raw-count assay robustly
+assn <- intersect(c("unstranded", "HTSeq - Counts"), SummarizedExperiment::assayNames(se_raw))[1]
+if (is.na(assn)) {
+  stop("No suitable raw-count assay found. Assays present: ",
+       paste(SummarizedExperiment::assayNames(se_raw), collapse = ", "),
+       call. = FALSE)
+}
+
+cts_all <- SummarizedExperiment::assay(se_raw, assn)
+meta_all <- as.data.frame(SummarizedExperiment::colData(se_raw))
+
+# Build condition factor
+keep_samples <- meta_all$sample_type %in% c("Primary Tumor", "Solid Tissue Normal")
+se_sub <- se_raw[, keep_samples, drop = FALSE]
+meta <- as.data.frame(SummarizedExperiment::colData(se_sub))
+meta$condition <- factor(ifelse(meta$sample_type == "Solid Tissue Normal", "Normal", "Tumor"),
+                         levels = c("Normal", "Tumor"))
+
+# Validate group sizes
+tab_cond <- table(meta$condition)
+if (!all(c("Normal","Tumor") %in% names(tab_cond))) {
+  stop("Both Normal and Tumor are required; found: ", paste(names(tab_cond), collapse=", "), call. = FALSE)
+}
+if (any(tab_cond < 10)) {
+  stop("Too few samples per group (need ≥10). Counts: ",
+       paste(names(tab_cond), as.integer(tab_cond), collapse = ", "),
+       call. = FALSE)
+}
+
+# QC metrics
+cts <- SummarizedExperiment::assay(se_sub, assn)
+
+rz <- function(x) {
+  # robust Z with MAD guard; fall back to scaled z when MAD=0
+  m <- stats::median(x)
+  s <- stats::mad(x, constant = 1.4826)
+  if (!is.finite(s) || s == 0) {
+    s2 <- stats::sd(x)
+    if (!is.finite(s2) || s2 == 0) return(rep(0, length(x)))
+    return((x - mean(x)) / s2)
+  }
+  (x - m) / s
+}
+
+libsizes  <- colSums(cts)
+zero_frac <- colMeans(cts == 0)
+detected  <- colSums(cts > 0)
+
+qc <- data.table(
+  sample_id   = colnames(cts),
+  condition   = as.character(meta$condition),
+  libsize     = libsizes,
+  zero_frac   = zero_frac,
+  detected    = detected,
+  z_libsize   = rz(log10(libsizes + 1)),
+  z_zero_frac = rz(zero_frac),
+  z_detected  = rz(detected)
+)
+qc[, outlier := (abs(z_libsize) > 4) | (abs(z_zero_frac) > 4) | (abs(z_detected) > 4)]
+
+# Drop outliers if present and re-validate sizes
+if (any(qc$outlier)) {
+  message("[QC] Dropping outliers: ", paste(qc[outlier == TRUE, sample_id], collapse = ", "))
+  keep_idx <- !qc$outlier
+  se_sub   <- se_sub[, keep_idx, drop = FALSE]
+  meta     <- as.data.frame(SummarizedExperiment::colData(se_sub))
+  meta$condition <- factor(ifelse(meta$sample_type == "Solid Tissue Normal", "Normal", "Tumor"),
+                           levels = c("Normal","Tumor"))
+  tab2 <- table(meta$condition)
+  if (any(tab2 < 10)) {
+    stop("After outlier removal, too few samples per group: ",
+         paste(names(tab2), as.integer(tab2), collapse = ", "), call. = FALSE)
+  }
+  qc <- qc[keep_idx]
+}
+
+# Persist artifacts
+clean_rds <- here::here("data", "tcga_kirc_se_clean.rds")
+saveRDS(se_sub, clean_rds)
+
+log_dir <- here::here("logs")
+if (!dir.exists(log_dir)) dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+data.table::fwrite(qc, here::here("logs", "sample_qc_metrics.tsv"), sep = "\t")
+
+# Console summary
+cat(
+  "[Subset/QC]\n",
+  "- Assay: ", assn, "\n",
+  "- Samples (kept): ", ncol(se_sub), "\n",
+  "- Normal/Tumor: ", paste(names(table(meta$condition)), as.integer(table(meta$condition)), collapse = " / "), "\n",
+  "- Outliers dropped: ", sum(qc$outlier), "\n",
+  "- Saved SE: ", normalizePath(clean_rds, winslash = "/"), "\n",
+  "- QC table: ", normalizePath(here::here("logs", "sample_qc_metrics.tsv"), winslash = "/"), "\n",
+  sep = ""
+)
+```
+
+CPM prefilter → TMM → exports
+```{r normalize_export, echo=TRUE}
+# ---- normalize_export ----
+suppressPackageStartupMessages({
+  library(here); library(SummarizedExperiment)
+  library(edgeR); library(data.table)
+})
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# Load cleaned SE
+clean_rds <- here::here("data", "tcga_kirc_se_clean.rds")
+if (!file.exists(clean_rds)) stop("Missing cleaned RDS: ", clean_rds, call. = FALSE)
+se_clean <- readRDS(clean_rds)
+stopifnot(inherits(se_clean, "SummarizedExperiment"))
+
+# Choose counts assay
+assn <- intersect(c("unstranded","HTSeq - Counts"), SummarizedExperiment::assayNames(se_clean))[1]
+if (is.na(assn)) {
+  stop("No suitable raw-count assay found. Assays present: ",
+       paste(SummarizedExperiment::assayNames(se_clean), collapse=", "), call. = FALSE)
+}
+cts   <- SummarizedExperiment::assay(se_clean, assn)
+smeta <- as.data.frame(SummarizedExperiment::colData(se_clean))
+
+# Ensure condition factor
+if (!"condition" %in% names(smeta)) {
+  smeta$condition <- factor(ifelse(smeta$sample_type == "Solid Tissue Normal","Normal","Tumor"),
+                            levels = c("Normal","Tumor"))
+}
+grp_tab <- table(smeta$condition)
+if (!all(c("Normal","Tumor") %in% names(grp_tab))) {
+  stop("Both Normal and Tumor required; found: ", paste(names(grp_tab), collapse=", "), call. = FALSE)
+}
+if (any(grp_tab < 10)) {
+  stop("Too few samples per group: ", paste(names(grp_tab), as.integer(grp_tab), collapse=", "), call. = FALSE)
+}
+
+# CPM prefilter (relative to smallest group, min 10)
+dge0     <- DGEList(counts = cts)
+cpm_mat  <- edgeR::cpm(dge0)
+min_keep <- max(10L, min(as.integer(grp_tab)))
+keep_g   <- rowSums(cpm_mat > 1) >= min_keep
+if (!any(keep_g)) stop("Prefilter removed all genes; check inputs.", call. = FALSE)
+se_filt  <- se_clean[keep_g, , drop = FALSE]
+
+# TMM normalization
+dge <- DGEList(counts = SummarizedExperiment::assay(se_filt, assn))
+dge <- calcNormFactors(dge, method = "TMM")
+if (any(!is.finite(dge$samples$norm.factors))) {
+  stop("Non-finite TMM normalization factors.", call. = FALSE)
+}
+
+# Persist bundle
+out_dir <- here::here("outputs"); if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+bundle_path <- here::here("outputs", "kirc_clean_tmm_objects.rds")
+saveRDS(list(
+  se_clean_filtered = se_filt,
+  assay_name        = assn,
+  dge_tmm           = dge,
+  sample_meta       = smeta,
+  gene_meta         = as.data.frame(SummarizedExperiment::rowData(se_filt))
+), file = bundle_path)
+
+# Export TSVs
+expr_mat <- SummarizedExperiment::assay(se_filt, assn)
+gmeta    <- as.data.frame(SummarizedExperiment::rowData(se_filt))
+gene_ids <- rownames(expr_mat) %||% rownames(gmeta)
+
+gene_name_col <- if ("gene_name" %in% names(gmeta)) gmeta$gene_name else NULL
+
+# Build expression table without losing rownames
+expr_dt <- as.data.table(expr_mat, keep.rownames = "gene_id")
+setnames(expr_dt, "gene_id", "gene_id")
+if (!is.null(gene_name_col)) {
+  expr_dt[, gene_name := as.character(gene_name_col)]
+  setcolorder(expr_dt, c("gene_id","gene_name", setdiff(names(expr_dt), c("gene_id","gene_name"))))
+} else {
+  expr_dt[, gene_name := NA_character_]
+  setcolorder(expr_dt, c("gene_id","gene_name", setdiff(names(expr_dt), c("gene_id","gene_name"))))
+}
+
+# Samples table
+smeta_out <- as.data.table(smeta, keep.rownames = "sample_id")
+# Flatten list-cols defensively
+for (j in names(smeta_out)) {
+  if (is.list(smeta_out[[j]])) smeta_out[[j]] <- vapply(smeta_out[[j]], paste, "", collapse = ";")
+}
+
+# Genes table
+gmeta_dt <- as.data.table(gmeta, keep.rownames = "gene_id")
+if (!"gene_id" %in% names(gmeta_dt)) gmeta_dt[, gene_id := gene_ids]
+
+# Write files
+dir.create(here::here("data"), recursive = TRUE, showWarnings = FALSE)
+fwrite(expr_dt,  here::here("data", "tcga_kirc_expression.tsv"), sep = "\t")
+fwrite(smeta_out, here::here("data", "tcga_kirc_samples.tsv"),   sep = "\t")
+fwrite(gmeta_dt,  here::here("data", "tcga_kirc_genes.tsv"),     sep = "\t")
+
+# Console summary
+cat(
+  "[Filter/Normalize]\n",
+  "- Assay: ", assn, "\n",
+  "- Samples: ", ncol(expr_mat), " (Normal=", grp_tab[["Normal"]], "; Tumor=", grp_tab[["Tumor"]], ")\n",
+  "- Genes kept: ", nrow(expr_mat), " of ", nrow(cts), " after CPM filter (min_keep=", min_keep, ")\n",
+  "- Saved bundle: ", normalizePath(bundle_path, winslash = "/"), "\n",
+  "- TSVs: data/tcga_kirc_expression.tsv, data/tcga_kirc_samples.tsv, data/tcga_kirc_genes.tsv\n",
+  sep = ""
+)
+```
+DE setup & bundle load
+```{r de_setup_libs_and_bundle, echo=TRUE}
+# ---- de_setup_libs_and_bundle ----
+suppressPackageStartupMessages({
+  library(here); library(SummarizedExperiment); library(data.table)
+})
+
+bundle_path <- here::here("outputs","kirc_clean_tmm_objects.rds")
+if (!file.exists(bundle_path)) stop("Missing bundle: ", bundle_path, call. = FALSE)
+B <- readRDS(bundle_path)
+
+# Extract + validate
+se_filt <- B$se_clean_filtered
+assn    <- B$assay_name
+smeta   <- as.data.frame(B$sample_meta)
+gmeta   <- as.data.frame(B$gene_meta)
+
+stopifnot(inherits(se_filt, "SummarizedExperiment"),
+          is.character(assn), length(assn) == 1L,
+          assn %in% SummarizedExperiment::assayNames(se_filt))
+
+cts_all  <- SummarizedExperiment::assay(se_filt, assn)
+
+# Build meta0 with rownames = sample IDs aligned to counts
+meta0 <- smeta
+if (is.null(rownames(meta0)) || !all(rownames(meta0) %in% colnames(cts_all))) {
+  rownames(meta0) <- colnames(cts_all)
+}
+stopifnot(identical(rownames(meta0), colnames(cts_all)))
+
+# Ensure condition factor exists (Normal/Tumor)
+if (!"condition" %in% names(meta0)) {
+  meta0$condition <- factor(ifelse(meta0$sample_type == "Solid Tissue Normal","Normal","Tumor"),
+                            levels = c("Normal","Tumor"))
+}
+
+# Build symbol map: gene_id_core (strip version) + gene_name if present
+gene_ids <- rownames(gmeta)
+if (is.null(gene_ids) || length(gene_ids) != nrow(gmeta)) {
+  gene_ids <- rownames(cts_all)
+}
+gene_id_core <- sub("\\.\\d+$", "", gene_ids)
+gene_name <- if ("gene_name" %in% names(gmeta)) as.character(gmeta$gene_name) else NA_character_
+
+sym_map <- data.table(gene_id_core = gene_id_core, gene_name = gene_name)
+
+# Minimal echoes
+cat("[DE setup]\n",
+    "- Assay: ", assn, "\n",
+    "- Genes: ", nrow(cts_all), " | Samples: ", ncol(cts_all), "\n",
+    "- meta0 columns: ", paste(head(colnames(meta0), 10), collapse = ", "),
+    if (ncol(meta0) > 10) " ...", "\n",
+    "- sym_map: ", nrow(sym_map), " rows (gene_id_core, gene_name)\n",
+    sep = "")
+```
+covariate selection
+```{r de_covariates_select, echo=TRUE}
+# ---- de_covariates_select ----
+stopifnot(exists("meta0"), exists("cts_all"))
+
+meta_all <- meta0
+stopifnot(identical(rownames(meta_all), colnames(cts_all)))
+if (!"condition" %in% names(meta_all)) {
+  meta_all$condition <- factor(ifelse(meta_all$sample_type == "Solid Tissue Normal","Normal","Tumor"),
+                               levels = c("Normal","Tumor"))
+}
+
+pick_first <- function(df, xs){ for (k in xs) if (k %in% names(df)) return(df[[k]]); NULL }
+
+covar_df <- within(meta_all, {
+  sex    <- factor(pick_first(meta_all, c("gender","sex")), exclude = NULL)
+  center <- factor(pick_first(meta_all, c("TSS","tissue_source_site","center")), exclude = NULL)
+  plate  <- factor(pick_first(meta_all, c("plate","aliquot_plate","plate_id")), exclude = NULL)
+  batch  <- factor(pick_first(meta_all, c("batch","SequencingRun","run")), exclude = NULL)
+})
+
+cand <- c("sex","center","plate","batch")
+informative <- vapply(cand, function(nm) {
+  v <- covar_df[[nm]]
+  !is.null(v) && is.factor(v) && nlevels(v) > 1 && !all(is.na(v))
+}, logical(1))
+cand <- cand[informative]
+
+# Keep terms that have representation across groups and avoid single-sample levels
+ok_terms <- character(0)
+for (nm in cand) {
+  v <- droplevels(covar_df[[nm]])
+  # require at least 2 levels with ≥2 samples each
+  lvl_counts <- table(v)
+  if (sum(lvl_counts >= 2) < 2) next
+  xt <- table(v, covar_df$condition, useNA = "no")
+  # each kept level must appear in ≥1 sample of at least one group; drop levels with zero count
+  xt <- xt[rowSums(xt) > 0, , drop = FALSE]
+  # keep term if no level is perfectly nested in only one group with a single sample
+  if (all(rowSums(xt > 0) >= 1)) ok_terms <- c(ok_terms, nm)
+}
+
+batch_terms <- unique(ok_terms)
+batch_df <- if (length(batch_terms)) as.data.frame(covar_df[batch_terms]) else NULL
+if (!is.null(batch_df)) stopifnot(identical(rownames(batch_df), colnames(cts_all)))
+
+cat("[Batch covariates]\n",
+    "- candidates: ", paste(c("sex","center","plate","batch"), collapse = ", "), "\n",
+    "- selected: ", if (length(batch_terms)) paste(batch_terms, collapse = ", ") else "(none)", "\n",
+    sep = "")
+```
+
+DE Helpers
+```{r de_helpers_run_de, echo=TRUE}
+# ---- de_helpers_run_de ----
+suppressPackageStartupMessages({
+  library(edgeR); library(limma); library(data.table)
+})
+
+run_de <- function(counts, meta, group_factor, group_levels, label,
+                   sym_map, batch_df = NULL, sv_mat = NULL) {
+  # --- guards ---
+  stopifnot(is.matrix(counts) || is.data.frame(counts))
+  counts <- as.matrix(counts)
+  stopifnot(is.data.frame(meta), length(group_levels) == 2L, is.character(label))
+  stopifnot(is.factor(group_factor) || is.character(group_factor))
+  if (is.character(group_factor)) group_factor <- factor(group_factor, levels = group_levels)
+  group_factor <- droplevels(factor(group_factor, levels = group_levels))
+  stopifnot(identical(colnames(counts), rownames(meta)))
+  stopifnot(identical(colnames(counts), names(group_factor)))
+  if (!is.null(batch_df)) stopifnot(is.data.frame(batch_df), identical(rownames(batch_df), colnames(counts)))
+  if (!is.null(sv_mat))   stopifnot(is.data.frame(sv_mat)   || is.matrix(sv_mat),
+                                    identical(rownames(sv_mat), colnames(counts)))
+  stopifnot(is.data.frame(sym_map), all(c("gene_id_core","gene_name") %in% names(sym_map)))
+
+  # --- design matrix ---
+  df <- data.frame(group = group_factor, row.names = colnames(counts))
+  if (!is.null(batch_df) && ncol(batch_df) > 0) {
+    # drop degenerate single-level cols
+    keep <- vapply(batch_df, function(v) is.factor(v) && nlevels(droplevels(v)) > 1, logical(1))
+    if (any(keep)) df <- cbind(df, batch_df[, keep, drop = FALSE])
+  }
+  if (!is.null(sv_mat) && ncol(as.data.frame(sv_mat)) > 0) {
+    sv_df <- as.data.frame(sv_mat)
+    colnames(sv_df) <- make.names(colnames(sv_df))
+    df <- cbind(df, sv_df)
+  }
+  # formula like: ~ 0 + group + sex + center + SV1 + SV2 ...
+  rhs <- paste(setdiff(colnames(df), "group"), collapse = " + ")
+  frm <- as.formula(sprintf("~ 0 + group%s", if (nchar(rhs)) paste0(" + ", rhs) else ""))
+
+  # --- voom/fit ---
+  dge <- DGEList(counts = counts)
+  dge <- calcNormFactors(dge, method = "TMM")
+  design <- model.matrix(frm, data = df)
+  v <- voom(dge, design, plot = FALSE)
+  fit <- lmFit(v, design)
+
+  # contrast: groupB - groupA (B = group_levels[2], A = group_levels[1])
+  gA <- paste0("group", group_levels[1])
+  gB <- paste0("group", group_levels[2])
+  if (!all(c(gA, gB) %in% colnames(design))) {
+    stop("Design is missing group columns: ", paste(setdiff(c(gA, gB), colnames(design)), collapse = ", "), call. = FALSE)
+  }
+  contr <- makeContrasts(contrasts = setNames(sprintf("%s-%s", gB, gA), "BvsA"), levels = design)
+  fit2  <- contrasts.fit(fit, contr)
+  fit2  <- eBayes(fit2, trend = TRUE, robust = TRUE)
+
+  tt <- data.table(topTable(fit2, coef = "BvsA", number = Inf, sort.by = "P"))
+  setnames(tt, old = c("adj.P.Val"), new = c("FDR"))
+  tt[, gene_id := rownames(v$E)]
+  tt[, gene_id_core := sub("\\.\\d+$", "", gene_id)]
+
+  # join symbols (left join)
+  sym_sub <- unique(sym_map[, .(gene_id_core, gene_name)])
+  res <- merge(tt, sym_sub, by = "gene_id_core", all.x = TRUE, sort = FALSE)
+  setcolorder(res, c("gene_id", "gene_id_core", "gene_name",
+                     setdiff(names(res), c("gene_id","gene_id_core","gene_name"))))
+
+  # write outputs
+  dir.create(here::here("results"), showWarnings = FALSE, recursive = TRUE)
+  dir.create(here::here("outputs"), showWarnings = FALSE, recursive = TRUE)
+  out_csv <- here::here("results", sprintf("kirc_%s_limma.csv", label))
+  fwrite(res, out_csv)
+
+  out_rds <- here::here("outputs", sprintf("kirc_%s_objects.rds", label))
+  saveRDS(list(label = label,
+               group_levels = group_levels,
+               design = design,
+               fit = fit2,
+               voom = v,
+               norm_factors = dge$samples$norm.factors),
+          out_rds)
+
+  cat("[", label, "] Saved: ", normalizePath(out_csv, winslash = "/"),
+      " ; ", normalizePath(out_rds, winslash = "/"), "\n", sep = "")
+
+  list(results = res, fit = fit2, voom = v, out_csv = out_csv, out_rds = out_rds)
+}
+```
+
+
+DE ccRCC vs. Normal
+```{r de_ccrcc_vs_normal, echo=TRUE}
+# ---- de_ccrcc_vs_normal ----
+suppressPackageStartupMessages({ library(SummarizedExperiment); library(edgeR); library(limma); library(sva); library(data.table) })
+
+# Preconditions
+stopifnot(exists("se_filt"), exists("assn"), inherits(se_filt, "SummarizedExperiment"))
+stopifnot(exists("meta0"), is.data.frame(meta0))
+stopifnot(exists("sym_map"), is.data.frame(sym_map))
+if (!exists("run_de")) stop("Missing helper 'run_de'. Source your DE function before running this chunk.", call. = FALSE)
+
+counts_all <- SummarizedExperiment::assay(se_filt, assn)
+# Ensure meta0 rownames are sample IDs matching counts
+if (!identical(rownames(meta0), colnames(counts_all))) {
+  rownames(meta0) <- colnames(counts_all)
+}
+stopifnot(identical(rownames(meta0), colnames(counts_all)))
+
+# Ensure condition factor
+if (!"condition" %in% names(meta0)) {
+  meta0$condition <- factor(ifelse(meta0$sample_type == "Solid Tissue Normal","Normal","Tumor"),
+                            levels = c("Normal","Tumor"))
+}
+
+# Contrast builder (internal)
+make_contrast <- function(label, sample_selector, group_builder, group_levels){
+  meta_all <- meta0
+  keep_ids <- rownames(meta_all)[ sample_selector(meta_all) ]
+  if (!length(keep_ids)) stop("Selector kept 0 samples for ", label, call. = FALSE)
+
+  keep_ids <- intersect(keep_ids, colnames(counts_all))
+  if (length(keep_ids) < 20) stop("After intersection, too few samples for ", label, call. = FALSE)
+
+  counts <- counts_all[, keep_ids, drop = FALSE]
+  meta   <- meta_all[keep_ids, , drop = FALSE]
+  stopifnot(identical(colnames(counts), rownames(meta)))
+
+  grp <- factor(group_builder(meta), levels = group_levels)
+  names(grp) <- colnames(counts)
+  keep <- !is.na(grp)
+  counts <- counts[, keep, drop = FALSE]
+  meta   <- meta[keep, , drop = FALSE]
+  grp    <- droplevels(grp[keep]); names(grp) <- colnames(counts)
+
+  tab <- table(grp)
+  if (!(length(tab) == 2 && all(tab >= 10))) {
+    stop("Group size check failed for ", label, " -> ", paste(names(tab), as.integer(tab), collapse=" / "), call. = FALSE)
+  }
+
+  # Batch covariates
+  pick_first <- function(df, xs){ for (k in xs) if (k %in% names(df)) return(df[[k]]); NULL }
+  covar_df <- within(meta, {
+    sex    <- factor(pick_first(meta, c("gender","sex")), exclude = NULL)
+    center <- factor(pick_first(meta, c("TSS","tissue_source_site","center")), exclude = NULL)
+    plate  <- factor(pick_first(meta, c("plate","aliquot_plate","plate_id")), exclude = NULL)
+    batch  <- factor(pick_first(meta, c("batch","SequencingRun","run")), exclude = NULL)
+  })
+  cand <- c("sex","center","plate","batch")
+  informative <- vapply(cand, function(nm) { v <- covar_df[[nm]]; !is.null(v) && is.factor(v) && nlevels(v) > 1 && !all(is.na(v)) }, logical(1))
+  cand <- cand[informative]
+  ok_terms <- character(0)
+  for (nm in cand) {
+    v <- droplevels(covar_df[[nm]])
+    if (sum(table(v) >= 2) < 2) next
+    xt <- table(v, grp)
+    xt <- xt[rowSums(xt) > 0, , drop = FALSE]
+    if (all(rowSums(xt > 0) >= 1)) ok_terms <- c(ok_terms, nm)
+  }
+  batch_df <- if (length(ok_terms)) as.data.frame(covar_df[ok_terms]) else NULL
+  if (!is.null(batch_df)) stopifnot(identical(rownames(batch_df), colnames(counts)))
+
+  # Capped SVA (names aligned)
+  compute_sva <- function(counts_sub, grp_named){
+    dge <- edgeR::DGEList(counts = counts_sub)
+    dge <- edgeR::calcNormFactors(dge)
+    design <- model.matrix(~ grp_named)
+    v <- limma::voom(dge, design, plot = FALSE)
+    out <- NULL
+    try({
+      n.sv <- sva::num.sv(dat = v$E, mod = design, method = "be")
+      n.sv <- max(0, min(n.sv, floor(ncol(counts_sub)/3)))
+      if (is.finite(n.sv) && n.sv > 0) {
+        svobj <- sva::sva(dat = v$E, mod = design, mod0 = model.matrix(~1), n.sv = n.sv)
+        out <- setNames(as.data.frame(svobj$sv), paste0("SV", seq_len(n.sv)))
+        rownames(out) <- colnames(counts_sub)
+      }
+    }, silent = TRUE)
+    out
+  }
+  sv_mat <- compute_sva(counts, grp)
+
+  stopifnot(identical(colnames(counts), names(grp)),
+            is.null(batch_df) || identical(rownames(batch_df), colnames(counts)),
+            is.null(sv_mat)   || identical(rownames(sv_mat),   colnames(counts)))
+
+  list(label = label, counts = counts, meta = meta, grp = grp, batch_df = batch_df, sv_mat = sv_mat)
+}
+
+# Build and run contrast
+con <- make_contrast(
+  label = "ccrcc_vs_normal_kidney",
+  sample_selector = function(m) m$condition %in% c("Tumor","Normal"),
+  group_builder   = function(m) m$condition,
+  group_levels    = c("Normal","Tumor")
+)
+
+cat("[ccRCC vs Normal] group sizes -> ",
+    paste(names(table(con$grp)), as.integer(table(con$grp)), collapse=" | "), "\n")
+
+res1 <- run_de(
+  counts       = as.matrix(con$counts),
+  meta         = con$meta,
+  group_factor = con$grp,
+  group_levels = c("Normal","Tumor"),
+  label        = con$label,
+  sym_map      = sym_map[, .(gene_id_core, gene_name)],
+  batch_df     = con$batch_df,
+  sv_mat       = con$sv_mat
+)
+
+dt <- res1$results
+out_exists <- file.exists(here::here("results","kirc_ccrcc_vs_normal_kidney_limma.csv"))
+cat("[ccRCC vs Normal] rows:", nrow(dt),
+    "| FDR<0.05:", sum(dt$FDR < 0.05, na.rm = TRUE),
+    "| wrote CSV:", out_exists, "\n")
+```
+DE — HG vs LG, tumor-only
+```{r de_hg_vs_lg_ccrcc, echo=TRUE}
+# ---- de_hg_vs_lg_ccrcc ----
+suppressPackageStartupMessages({ library(SummarizedExperiment); library(edgeR); library(limma); library(sva); library(data.table) })
+
+# Preconditions
+stopifnot(exists("se_filt"), exists("assn"), inherits(se_filt, "SummarizedExperiment"))
+stopifnot(exists("meta0"), is.data.frame(meta0))
+stopifnot(exists("sym_map"), is.data.frame(sym_map))
+if (!exists("run_de")) stop("Missing helper 'run_de'.", call. = FALSE)
+
+counts_all <- SummarizedExperiment::assay(se_filt, assn)
+if (!identical(rownames(meta0), colnames(counts_all))) rownames(meta0) <- colnames(counts_all)
+stopifnot(identical(rownames(meta0), colnames(counts_all)))
+
+# Ensure condition factor
+if (!"condition" %in% names(meta0)) {
+  meta0$condition <- factor(ifelse(meta0$sample_type == "Solid Tissue Normal","Normal","Tumor"),
+                            levels = c("Normal","Tumor"))
+}
+
+# Ensure grade_group (LG/HG) exists
+grade_first <- function(df, xs){ for (k in xs) if (k %in% names(df)) return(df[[k]]); return(NULL) }
+if (!"grade_group" %in% names(meta0)) {
+  raw_grade <- toupper(as.character(grade_first(meta0, c("tumor_grade","neoplasm_histologic_grade","grade","histologic_grade"))))
+  parse_grade <- function(x){
+    x <- gsub("\\s+", "", x)
+    ifelse(grepl("G3|G4|HIGH", x), "HG",
+           ifelse(grepl("G1|G2|LOW", x), "LG", NA_character_))
+  }
+  meta0$grade_group <- factor(ifelse(meta0$condition=="Tumor", parse_grade(raw_grade), NA_character_),
+                              levels = c("LG","HG"))
+}
+
+# Selector: tumor-only with non-NA grade_group
+sel <- meta0$condition == "Tumor" & !is.na(meta0$grade_group)
+keep_ids <- rownames(meta0)[sel]
+keep_ids <- intersect(keep_ids, colnames(counts_all))
+if (length(keep_ids) < 20) stop(sprintf("Too few tumor samples with LG/HG grade (%d).", length(keep_ids)), call. = FALSE)
+
+# Subset aligned
+counts <- counts_all[, keep_ids, drop = FALSE]
+meta   <- meta0[keep_ids, , drop = FALSE]
+stopifnot(identical(colnames(counts), rownames(meta)))
+
+# Group factor
+grp <- factor(meta$grade_group, levels = c("LG","HG"))
+names(grp) <- colnames(counts)
+tab <- table(grp)
+if (!(length(tab) == 2 && all(tab >= 10))) {
+  stop("Group size check failed -> ", paste(names(tab), as.integer(tab), collapse=" / "), call. = FALSE)
+}
+
+# Batch covariates (aligned)
+pick_first <- function(df, xs){ for (k in xs) if (k %in% names(df)) return(df[[k]]); NULL }
+covar_df <- within(meta, {
+  sex    <- factor(pick_first(meta, c("gender","sex")), exclude = NULL)
+  center <- factor(pick_first(meta, c("TSS","tissue_source_site","center")), exclude = NULL)
+  plate  <- factor(pick_first(meta, c("plate","aliquot_plate","plate_id")), exclude = NULL)
+  batch  <- factor(pick_first(meta, c("batch","SequencingRun","run")), exclude = NULL)
+})
+cand <- c("sex","center","plate","batch")
+informative <- vapply(cand, function(nm) { v <- covar_df[[nm]]; !is.null(v) && is.factor(v) && nlevels(v) > 1 && !all(is.na(v)) }, logical(1))
+cand <- cand[informative]
+ok_terms <- character(0)
+for (nm in cand) {
+  v <- droplevels(covar_df[[nm]])
+  if (sum(table(v) >= 2) < 2) next
+  xt <- table(v, grp); xt <- xt[rowSums(xt) > 0, , drop = FALSE]
+  if (all(rowSums(xt > 0) >= 1)) ok_terms <- c(ok_terms, nm)
+}
+batch_df <- if (length(ok_terms)) as.data.frame(covar_df[ok_terms]) else NULL
+if (!is.null(batch_df)) stopifnot(identical(rownames(batch_df), colnames(counts)))
+
+# Capped SVA (aligned)
+compute_sva <- function(counts_sub, grp_named){
+  dge <- edgeR::DGEList(counts = counts_sub); dge <- edgeR::calcNormFactors(dge)
+  design <- model.matrix(~ grp_named)
+  v <- limma::voom(dge, design, plot = FALSE)
+  out <- NULL
+  try({
+    n.sv <- sva::num.sv(dat = v$E, mod = design, method = "be")
+    n.sv <- max(0, min(n.sv, floor(ncol(counts_sub)/3)))
+    if (is.finite(n.sv) && n.sv > 0) {
+      svobj <- sva::sva(dat = v$E, mod = design, mod0 = model.matrix(~1), n.sv = n.sv)
+      out <- setNames(as.data.frame(svobj$sv), paste0("SV", seq_len(n.sv)))
+      rownames(out) <- colnames(counts_sub)
+    }
+  }, silent = TRUE)
+  out
+}
+sv_mat <- compute_sva(counts, grp)
+stopifnot(is.null(sv_mat) || identical(rownames(sv_mat), colnames(counts)))
+
+# Run DE
+res_hg_lg <- run_de(
+  counts       = as.matrix(counts),
+  meta         = meta,
+  group_factor = grp,
+  group_levels = c("LG","HG"),
+  label        = "hg_vs_lg_ccrcc",
+  sym_map      = sym_map[, .(gene_id_core, gene_name)],
+  batch_df     = batch_df,
+  sv_mat       = sv_mat
+)
+
+dt <- res_hg_lg$results
+out_exists <- file.exists(here::here("results","kirc_hg_vs_lg_ccrcc_limma.csv"))
+cat("[HG vs LG] rows:", nrow(dt),
+    "| FDR<0.05:", sum(dt$FDR < 0.05, na.rm = TRUE),
+    "| wrote CSV:", out_exists, "\n")
+```
+DE — HG ccRCC vs Normal
+```{r de_hg_ccrcc_vs_normal, echo=TRUE}
+# ---- de_hg_ccrcc_vs_normal (fixed selector) ----
+suppressPackageStartupMessages({ library(SummarizedExperiment); library(edgeR); library(limma); library(sva); library(data.table) })
+
+stopifnot(exists("se_filt"), exists("assn"), inherits(se_filt, "SummarizedExperiment"))
+stopifnot(exists("meta0"), is.data.frame(meta0))
+stopifnot(exists("sym_map"), is.data.frame(sym_map))
+if (!exists("run_de")) stop("Missing helper 'run_de'.", call. = FALSE)
+
+counts_all <- SummarizedExperiment::assay(se_filt, assn)
+if (!identical(rownames(meta0), colnames(counts_all))) rownames(meta0) <- colnames(counts_all)
+stopifnot(identical(rownames(meta0), colnames(counts_all)))
+
+# Ensure condition
+if (!"condition" %in% names(meta0)) {
+  meta0$condition <- factor(ifelse(meta0$sample_type == "Solid Tissue Normal","Normal","Tumor"),
+                            levels = c("Normal","Tumor"))
+}
+
+# Derive grade_group from any "*grade*" column if missing
+if (!"grade_group" %in% names(meta0)) {
+  derive_grade_group <- function(df, condition_col = "condition") {
+    cand_cols <- grep("grade", names(df), value = TRUE, ignore.case = TRUE)
+    if (!length(cand_cols)) return(list(grade = factor(rep(NA_character_, nrow(df)), levels = c("LG","HG")),
+                                        source = NA_character_, table = NULL))
+    pick <- NA_character_
+    for (nm in cand_cols) {
+      v <- df[[nm]]; tumor_mask <- df[[condition_col]] == "Tumor"
+      if (sum(!is.na(v[tumor_mask])) >= 20) { pick <- nm; break }
+    }
+    if (is.na(pick)) pick <- cand_cols[1L]
+    raw <- df[[pick]]
+    to_lghg <- function(x) {
+      x <- toupper(as.character(x))
+      x <- gsub("[^A-Z0-9]+", "", x)
+      ifelse(grepl("G3|G4|HIGH", x), "HG",
+             ifelse(grepl("G1|G2|LOW", x), "LG", NA_character_))
+    }
+    out <- ifelse(df[[condition_col]] == "Tumor", to_lghg(raw), NA_character_)
+    fac <- factor(out, levels = c("LG","HG"))
+    list(grade = fac, source = pick, table = table(fac, useNA = "ifany"))
+  }
+  gg <- derive_grade_group(meta0)
+  meta0$grade_group <- gg$grade
+  cat("[grade_group] source column:", gg$source, "| counts -> "); print(gg$table)
+}
+
+# Selector: Normal OR Tumor-HG (vectorized + NA-safe)
+sel <- (meta0$condition == "Normal") |
+       (meta0$condition == "Tumor" & meta0$grade_group == "HG")
+sel[is.na(sel)] <- FALSE
+
+keep_ids <- rownames(meta0)[sel]
+keep_ids <- intersect(keep_ids, colnames(counts_all))
+if (length(keep_ids) < 20) {
+  stop(sprintf("Too few samples for HG vs Normal (%d). Check grade labels.", length(keep_ids)), call. = FALSE)
+}
+
+# Subset aligned
+counts <- counts_all[, keep_ids, drop = FALSE]
+meta   <- meta0[keep_ids, , drop = FALSE]
+stopifnot(identical(colnames(counts), rownames(meta)))
+
+# Group factor
+grp <- factor(ifelse(meta$condition == "Normal", "Normal", "HG"), levels = c("Normal","HG"))
+names(grp) <- colnames(counts)
+tab <- table(grp); cat("[HG vs Normal] group sizes -> ", paste(names(tab), as.integer(tab), collapse=" | "), "\n")
+stopifnot(length(tab) == 2, all(tab >= 10))
+
+# Batch covariates
+pick_first <- function(df, xs){ for (k in xs) if (k %in% names(df)) return(df[[k]]); NULL }
+covar_df <- within(meta, {
+  sex    <- factor(pick_first(meta, c("gender","sex")), exclude = NULL)
+  center <- factor(pick_first(meta, c("TSS","tissue_source_site","center")), exclude = NULL)
+  plate  <- factor(pick_first(meta, c("plate","aliquot_plate","plate_id")), exclude = NULL)
+  batch  <- factor(pick_first(meta, c("batch","SequencingRun","run")), exclude = NULL)
+})
+cand <- c("sex","center","plate","batch")
+informative <- vapply(cand, function(nm) { v <- covar_df[[nm]]; !is.null(v) && is.factor(v) && nlevels(v) > 1 && !all(is.na(v)) }, logical(1))
+cand <- cand[informative]
+ok_terms <- character(0)
+for (nm in cand) {
+  v <- droplevels(covar_df[[nm]])
+  if (sum(table(v) >= 2) < 2) next
+  xt <- table(v, grp); xt <- xt[rowSums(xt) > 0, , drop = FALSE]
+  if (all(rowSums(xt > 0) >= 1)) ok_terms <- c(ok_terms, nm)
+}
+batch_df <- if (length(ok_terms)) as.data.frame(covar_df[ok_terms]) else NULL
+if (!is.null(batch_df)) stopifnot(identical(rownames(batch_df), colnames(counts)))
+
+# Capped SVA
+compute_sva <- function(counts_sub, grp_named){
+  dge <- edgeR::DGEList(counts = counts_sub); dge <- edgeR::calcNormFactors(dge)
+  design <- model.matrix(~ grp_named)
+  v <- limma::voom(dge, design, plot = FALSE)
+  out <- NULL
+  try({
+    n.sv <- sva::num.sv(dat = v$E, mod = design, method = "be")
+    n.sv <- max(0, min(n.sv, floor(ncol(counts_sub)/3)))
+    if (is.finite(n.sv) && n.sv > 0) {
+      svobj <- sva::sva(dat = v$E, mod = design, mod0 = model.matrix(~1), n.sv = n.sv)
+      out <- setNames(as.data.frame(svobj$sv), paste0("SV", seq_len(n.sv)))
+      rownames(out) <- colnames(counts_sub)
+    }
+  }, silent = TRUE)
+  out
+}
+sv_mat <- compute_sva(counts, grp)
+stopifnot(is.null(sv_mat) || identical(rownames(sv_mat), colnames(counts)))
+
+# Run DE
+res_hg_norm <- run_de(
+  counts       = as.matrix(counts),
+  meta         = meta,
+  group_factor = grp,
+  group_levels = c("Normal","HG"),
+  label        = "hg_ccrcc_vs_normal_kidney",
+  sym_map      = sym_map[, .(gene_id_core, gene_name)],
+  batch_df     = batch_df,
+  sv_mat       = sv_mat
+)
+
+dt <- res_hg_norm$results
+out_exists <- file.exists(here::here("results","kirc_hg_ccrcc_vs_normal_kidney_limma.csv"))
+cat("[HG vs Normal] rows:", nrow(dt),
+    " | FDR<0.05:", sum(dt$FDR < 0.05, na.rm = TRUE),
+    " | wrote CSV:", out_exists, "\n")
+```
+
+DE LG ccRCC vs. normal kidney
+```{r de_lg_ccrcc_vs_normal, echo=TRUE}
+# ---- de_lg_ccrcc_vs_normal (robust, knit-safe) ----
+suppressPackageStartupMessages({ library(SummarizedExperiment); library(edgeR); library(limma); library(sva); library(data.table) })
+
+stopifnot(exists("se_filt"), exists("assn"), inherits(se_filt, "SummarizedExperiment"))
+stopifnot(exists("meta0"), is.data.frame(meta0))
+stopifnot(exists("sym_map"), is.data.frame(sym_map))
+if (!exists("run_de")) stop("Missing helper 'run_de'.", call. = FALSE)
+
+counts_all <- SummarizedExperiment::assay(se_filt, assn)
+if (!identical(rownames(meta0), colnames(counts_all))) rownames(meta0) <- colnames(counts_all)
+stopifnot(identical(rownames(meta0), colnames(counts_all)))
+
+# Ensure condition
+if (!"condition" %in% names(meta0)) {
+  meta0$condition <- factor(ifelse(meta0$sample_type == "Solid Tissue Normal","Normal","Tumor"),
+                            levels = c("Normal","Tumor"))
+}
+
+# Derive grade_group (LG/HG) if missing or partially empty
+if (!"grade_group" %in% names(meta0) || all(is.na(meta0$grade_group))) {
+  derive_grade_group <- function(df, condition_col = "condition") {
+    cand_cols <- grep("grade", names(df), value = TRUE, ignore.case = TRUE)
+    pick <- if (length(cand_cols)) cand_cols[1L] else NA_character_
+    raw <- if (!is.na(pick)) df[[pick]] else rep(NA_character_, nrow(df))
+    to_lghg <- function(x) {
+      x <- toupper(as.character(x))
+      x <- gsub("[^A-Z0-9]+", "", x)
+      ifelse(grepl("G3|G4|HIGH", x), "HG",
+             ifelse(grepl("G1|G2|LOW", x), "LG", NA_character_))
+    }
+    out <- ifelse(df[[condition_col]] == "Tumor", to_lghg(raw), NA_character_)
+    factor(out, levels = c("LG","HG"))
+  }
+  meta0$grade_group <- derive_grade_group(meta0)
+}
+
+# Selector: Normal OR Tumor-LG (vectorized + NA-safe)
+sel <- (meta0$condition == "Normal") |
+       (meta0$condition == "Tumor" & meta0$grade_group == "LG")
+sel[is.na(sel)] <- FALSE
+
+keep_ids <- rownames(meta0)[sel]
+keep_ids <- intersect(keep_ids, colnames(counts_all))
+if (length(keep_ids) < 20) stop(sprintf("Too few samples for LG vs Normal (%d).", length(keep_ids)), call. = FALSE)
+
+# Subset aligned
+counts <- counts_all[, keep_ids, drop = FALSE]
+meta   <- meta0[keep_ids, , drop = FALSE]
+stopifnot(identical(colnames(counts), rownames(meta)))
+
+# Group factor
+grp <- factor(ifelse(meta$condition == "Normal", "Normal", "LG"), levels = c("Normal","LG"))
+names(grp) <- colnames(counts)
+tab <- table(grp)
+cat("[LG vs Normal] group sizes -> ", paste(names(tab), as.integer(tab), collapse=" | "), "\n")
+stopifnot(length(tab) == 2, all(tab >= 10))
+
+# Batch covariates (aligned)
+pick_first <- function(df, xs){ for (k in xs) if (k %in% names(df)) return(df[[k]]); NULL }
+covar_df <- within(meta, {
+  sex    <- factor(pick_first(meta, c("gender","sex")), exclude = NULL)
+  center <- factor(pick_first(meta, c("TSS","tissue_source_site","center")), exclude = NULL)
+  plate  <- factor(pick_first(meta, c("plate","aliquot_plate","plate_id")), exclude = NULL)
+  batch  <- factor(pick_first(meta, c("batch","SequencingRun","run")), exclude = NULL)
+})
+cand <- c("sex","center","plate","batch")
+informative <- vapply(cand, function(nm) { v <- covar_df[[nm]]; !is.null(v) && is.factor(v) && nlevels(v) > 1 && !all(is.na(v)) }, logical(1))
+cand <- cand[informative]
+ok_terms <- character(0)
+for (nm in cand) {
+  v <- droplevels(covar_df[[nm]])
+  if (sum(table(v) >= 2) < 2) next
+  xt <- table(v, grp); xt <- xt[rowSums(xt) > 0, , drop = FALSE]
+  if (all(rowSums(xt > 0) >= 1)) ok_terms <- c(ok_terms, nm)
+}
+batch_df <- if (length(ok_terms)) as.data.frame(covar_df[ok_terms]) else NULL
+if (!is.null(batch_df)) stopifnot(identical(rownames(batch_df), colnames(counts)))
+
+# Capped SVA
+compute_sva <- function(counts_sub, grp_named){
+  dge <- edgeR::DGEList(counts = counts_sub); dge <- edgeR::calcNormFactors(dge)
+  design <- model.matrix(~ grp_named)
+  v <- limma::voom(dge, design, plot = FALSE)
+  out <- NULL
+  try({
+    n.sv <- sva::num.sv(dat = v$E, mod = design, method = "be")
+    n.sv <- max(0, min(n.sv, floor(ncol(counts_sub)/3)))
+    if (is.finite(n.sv) && n.sv > 0) {
+      svobj <- sva::sva(dat = v$E, mod = design, mod0 = model.matrix(~1), n.sv = n.sv)
+      out <- setNames(as.data.frame(svobj$sv), paste0("SV", seq_len(n.sv)))
+      rownames(out) <- colnames(counts_sub)
+    }
+  }, silent = TRUE)
+  out
+}
+sv_mat <- compute_sva(counts, grp)
+stopifnot(is.null(sv_mat) || identical(rownames(sv_mat), colnames(counts)))
+
+# Run DE
+res_lg_norm <- run_de(
+  counts       = as.matrix(counts),
+  meta         = meta,
+  group_factor = grp,
+  group_levels = c("Normal","LG"),
+  label        = "lg_ccrcc_vs_normal_kidney",
+  sym_map      = sym_map[, .(gene_id_core, gene_name)],
+  batch_df     = batch_df,
+  sv_mat       = sv_mat
+)
+
+dt <- res_lg_norm$results
+out_exists <- file.exists(here::here("results","kirc_lg_ccrcc_vs_normal_kidney_limma.csv"))
+cat("[LG vs Normal] rows:", nrow(dt),
+    " | FDR<0.05:", sum(dt$FDR < 0.05, na.rm = TRUE),
+    " | wrote CSV:", out_exists, "\n")
+```
+
+index files + clinical summary
+```{r index_add_clinical, echo=TRUE}
+# ---- index_add_clinical ----
+suppressPackageStartupMessages({ library(here); library(data.table) })
+
+# Known DE result files
+de_files <- data.table(
+  contrast = c(
+    "ccRCC tumor vs normal kidney",
+    "HG ccRCC vs LG ccRCC",
+    "HG ccRCC vs normal kidney",
+    "LG ccRCC vs normal kidney"
+  ),
+  filename = c(
+    "kirc_ccrcc_vs_normal_kidney_limma.csv",
+    "kirc_hg_vs_lg_ccrcc_limma.csv",
+    "kirc_hg_ccrcc_vs_normal_kidney_limma.csv",
+    "kirc_lg_ccrcc_vs_normal_kidney_limma.csv"
+  ),
+  file_type = "DE_results",
+  relative_dir = "results"
+)
+
+# Clinical phenotype file
+clin_file <- data.table(
+  contrast     = "Clinical phenotype table",
+  filename     = "tcga_kirc_samples.tsv",
+  file_type    = "clinical",
+  relative_dir = "data"
+)
+
+files_tbl <- rbindlist(list(de_files, clin_file), fill = TRUE)
+
+# Build paths + basic file metadata
+files_tbl[, relative_path := file.path(relative_dir, filename)]
+files_tbl[, absolute_path := normalizePath(here::here(relative_dir, filename), winslash = "/", mustWork = FALSE)]
+meta <- lapply(files_tbl$absolute_path, function(p) if (file.exists(p)) file.info(p) else data.frame(size=NA, mtime=as.POSIXct(NA)))
+meta <- rbindlist(meta, fill = TRUE)
+files_idx <- cbind(files_tbl, meta[, .(size_bytes = size, modified = mtime)])
+files_idx[, exists := file.exists(absolute_path)]
+
+# Clinical quick sanity (rows/cols + must-have columns)
+clin_abs <- files_idx[file_type == "clinical", absolute_path]
+if (length(clin_abs) == 1L && file.exists(clin_abs)) {
+  clin_dt <- tryCatch(fread(clin_abs, nThread = 1L, showProgress = FALSE), error = function(e) NULL)
+  if (!is.null(clin_dt)) {
+    cat("[Clinical] rows:", nrow(clin_dt), " cols:", ncol(clin_dt), "\n")
+    must_cols <- c("sample_id","sample_type")
+    miss <- setdiff(must_cols, names(clin_dt))
+    if (length(miss)) cat("[Clinical] Missing columns:", paste(miss, collapse = ", "), "\n")
+  } else {
+    cat("[Clinical] Could not read:", clin_abs, "\n")
+  }
+}
+
+# Save index TSV
+dir.create(here::here("results"), showWarnings = FALSE, recursive = TRUE)
+out_tsv <- here::here("results", "file_index_all.tsv")
+fwrite(files_idx, out_tsv, sep = "\t")
+
+# Console summary
+print(files_idx[, .(file_type, contrast, relative_path, exists, size_bytes, modified)])
+cat("Index written to:", normalizePath(out_tsv, winslash = "/"), "\n")
+```
+Appendix summary
+```{r appendix_summary, echo=FALSE}
+# ---- appendix_summary (optional) ----
+suppressPackageStartupMessages({ library(here); library(data.table); library(knitr) })
+idx <- fread(here::here("results","file_index_all.tsv"))
+kable(idx[, .(file_type, contrast, relative_path, exists, size_bytes, modified)],
+      caption = "Output file index (for reproducibility)")
+```
+
